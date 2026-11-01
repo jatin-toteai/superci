@@ -1,16 +1,22 @@
 import pytest
 
-from launcher import SIZES, choose, price
+from launcher import FAMILIES, SIZES, choose, price
 from prices import ON_DEMAND, SPOT
 
 
 def test_the_smallest_size_that_fits_in_each_family_in_order():
-    assert choose(2, 8) == ["e2-standard-2", "n2d-standard-2", "c4d-standard-2"]
-    assert choose(4, 16) == ["e2-standard-4", "n2d-standard-4", "c4d-standard-4"]
-    assert choose(3, 8) == ["e2-standard-4", "n2d-standard-4", "c4d-standard-4"]
-    assert choose(2, 12) == ["e2-standard-4", "n2d-standard-4", "c4d-standard-4"]
-    assert choose(64, 256) == ["n2d-standard-64", "c4d-standard-64"]
+    assert choose(2, 8) == ["e2-standard-2", "c4d-standard-2", "n2d-standard-2"]
+    assert choose(4, 16) == ["e2-standard-4", "c4d-standard-4", "n2d-standard-4"]
+    assert choose(3, 8) == ["e2-standard-4", "c4d-standard-4", "n2d-standard-4"]
+    assert choose(2, 12) == ["e2-standard-4", "c4d-standard-4", "n2d-standard-4"]
+    assert choose(64, 256) == ["c4d-standard-64", "n2d-standard-64"]
     assert choose(65, 8) == []
+
+
+def test_families_are_in_spot_price_order_at_every_size_they_share():
+    for earlier, later in zip(FAMILIES, FAMILIES[1:]):
+        for n in set(SIZES[earlier]) & set(SIZES[later]):
+            assert SPOT[f"{earlier}-standard-{n}"] < SPOT[f"{later}-standard-{n}"], (earlier, later, n)
 
 
 def test_every_size_of_every_family_has_both_prices():

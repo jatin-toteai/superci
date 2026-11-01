@@ -92,8 +92,9 @@ def verify(authorization: str, audience: str, trust: dict, now: float) -> dict:
     raise PermissionError("bad token")
 
 
-# The machine families a job can run on, in the order they are tried.
-FAMILIES = ("e2", "n2d", "c4d")
+# The machine families a job can run on, in the order they are tried: by spot price in us-west4, e2 first and c4d
+# before n2d (c4d's spot price is below n2d's at every size they share; on demand it is the other way round).
+FAMILIES = ("e2", "c4d", "n2d")
 SIZES = {"e2": (2, 4, 8, 16, 32), "n2d": (2, 4, 8, 16, 32, 64), "c4d": (2, 4, 8, 16, 32, 64)}  # vCPUs; e2 stops at 32
 
 
