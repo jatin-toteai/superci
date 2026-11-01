@@ -4850,7 +4850,7 @@ impl<'a> ControlPlane<'a> {
             // placed again, twice at most, then the job fails with why (GitHub would otherwise keep it queued for a day).
             if j.state == "launched" && !j.seen_in_progress {
                 let age = now.saturating_sub(j.launched_ms.unwrap_or(j.at_ms));
-                let (wait, up_by) = if j.cloud == "aws" { (8 * 60_000, 90_000) } else { (3 * 60_000, 60_000) };
+                let (wait, up_by) = if j.cloud == "aws" || j.cloud == "gcp" { (8 * 60_000, 90_000) } else { (3 * 60_000, 60_000) };
                 let late = age > wait;
                 // Once it has had time to come up and has begun nothing, GitHub is asked at every sweep whether the
                 // job it is for still waits (one request): a machine nobody waits for is ended then, not minutes later.

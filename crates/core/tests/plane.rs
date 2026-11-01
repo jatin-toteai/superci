@@ -6921,6 +6921,35 @@ fn a_launcher_saying_no_room_makes_the_job_wait_and_the_sweep_tries_again() {
 }
 
 #[test]
+fn a_gcp_machine_whose_runner_is_not_online_has_eight_minutes_before_it_is_stopped_and_the_job_placed_again() {
+    // The runner of job 7's machine stays offline at GitHub: its machine has not booted, or its runner has not started.
+    let online = std::cell::Cell::new(false);
+    let holding = github_holding(&online);
+    let clouds = With(FakeClouds::default(), |r: &Request, body: &str| if r.url == "https://gcp.acme.example/launch" {
+        Some(Response::new(200, "application/json", r#"{"id":"superci-7","kind":"e2-standard-2"}"#))
+    } else { holding(r, body) });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.launchers = vec![Launcher { cloud: "gcp".into(), url: "https://gcp.acme.example".into() }];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(webhook("queued", None)));
+    let sent = |path: &str| clouds.0.calls.borrow().iter().filter(|c| c.0 == "POST" && c.1 == format!("https://gcp.acme.example{path}")).count();
+    assert_eq!((sent("/launch"), sent("/stop"), job(&store, 7)["state"].as_str()), (1, 0, Some("launched")));
+    // Four minutes, which is past a launcher's usual three: a GCP machine, booted from a full image, is still waited for.
+    clock.0.set(clock.0.get() + 4 * 60_000);
+    block_on(plane.alarm()).unwrap();
+    let waiting = job(&store, 7);
+    assert_eq!((sent("/launch"), sent("/stop"), waiting["state"].as_str(), waiting["retries"].as_u64().unwrap_or(0)), (1, 0, Some("launched"), 0), "{waiting}");
+    // Nine minutes, which is past eight: its machine is stopped and the job placed again, counted as a machine that did not start.
+    clock.0.set(clock.0.get() + 5 * 60_000);
+    block_on(plane.alarm()).unwrap();
+    let again = job(&store, 7);
+    assert_eq!((sent("/launch"), sent("/stop"), again["state"].as_str(), again["retries"].as_u64()), (2, 1, Some("launched"), Some(1)), "{again}");
+}
+
+#[test]
 fn a_runs_repository_environment_and_signing_key_are_read_as_they_are_or_said() {
     let clouds = With(FakeClouds::default(), |r: &Request, _: &str| (r.url == "https://api.github.com/repos/acme/app").then(|| Response::new(200, "application/json", r#"{"default_branch":"main"}"#)));
     let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
@@ -7119,6 +7148,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_gcp_launcher_is_told_spot_and_a_notice_link_and_its_machine_can_say_it_was_taken_back,
         a_gitlab_job_on_a_gcp_launcher_is_given_a_notice_link_by_its_job_id_and_its_machine_can_say_it_was_taken_back,
         a_launcher_saying_no_room_makes_the_job_wait_and_the_sweep_tries_again,
+        a_gcp_machine_whose_runner_is_not_online_has_eight_minutes_before_it_is_stopped_and_the_job_placed_again,
         a_runs_repository_environment_and_signing_key_are_read_as_they_are_or_said,
         a_failing_runner_that_takes_a_job_waiting_for_room_fails_it_and_its_own_job_gets_a_failing_runner_again,
         spot_pools_near_the_cheapest_in_any_region_are_asked_before_a_dearer_type_in_the_first
