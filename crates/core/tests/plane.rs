@@ -6789,6 +6789,29 @@ fn launchers_and_failing_runners_start_where_they_can_and_say_what_they_could_no
 }
 
 #[test]
+fn a_launcher_that_says_its_price_is_believed_and_one_that_does_not_is_priced_by_formula() {
+    // The same launcher, answering as each of its machines are billed: spot at its price, on demand at its own, and with no price at all.
+    let started = |job_id: u64, answer: &'static str| {
+        let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+        let clouds = With(FakeClouds::default(), move |r: &Request, _: &str| (r.url == "https://gcp.acme.example/launch").then(|| Response::new(200, "application/json", answer)));
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(app());
+        config.launchers = vec![Launcher { cloud: "gcp".into(), url: "https://gcp.acme.example".into() }];
+        let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+        block_on(plane.handle(labelled("queued", job_id, "acme/app", None, "superci")));
+        job(&store, job_id)
+    };
+    let j = started(1, r#"{"id":"superci-1","kind":"e2-standard-2","usd_per_hour":0.0104,"spot":true}"#);
+    assert_eq!((j["usd_per_hour"].as_f64(), j["machine_id"].as_str(), j["machine_type"].as_str(), j["on_demand"].as_bool().unwrap_or(false)), (Some(0.0104), Some("superci-1"), Some("e2-standard-2"), false), "{j}");
+    // The same launcher answering spot:false: an on-demand machine.
+    let j = started(2, r#"{"id":"superci-2","kind":"e2-standard-2","usd_per_hour":0.0755,"spot":false}"#);
+    assert_eq!((j["usd_per_hour"].as_f64(), j["on_demand"].as_bool().unwrap_or(false)), (Some(0.0755), true), "{j}");
+    // An answer with neither: priced as a launcher's machine is when it says nothing (Modal's formula), and not on demand.
+    let j = started(3, r#"{"id":"superci-3","kind":"e2-standard-2"}"#);
+    assert_eq!((j["usd_per_hour"].as_f64(), j["machine_id"].as_str(), j["on_demand"].as_bool().unwrap_or(false)), (Some(superci_core::plane::modal_usd_per_hour(2, 8)), Some("superci-3"), false), "{j}");
+}
+
+#[test]
 fn a_runs_repository_environment_and_signing_key_are_read_as_they_are_or_said() {
     let clouds = With(FakeClouds::default(), |r: &Request, _: &str| (r.url == "https://api.github.com/repos/acme/app").then(|| Response::new(200, "application/json", r#"{"default_branch":"main"}"#)));
     let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
@@ -6983,6 +7006,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_runs_cancelling_passes_over_what_its_record_lacks_and_a_runner_that_ends_before_it_takes_its_job_is_heard,
         machines_whose_jobs_went_elsewhere_hand_themselves_on_or_end_as_github_and_gitlab_say,
         launchers_and_failing_runners_start_where_they_can_and_say_what_they_could_not,
+        a_launcher_that_says_its_price_is_believed_and_one_that_does_not_is_priced_by_formula,
         a_runs_repository_environment_and_signing_key_are_read_as_they_are_or_said,
         a_failing_runner_that_takes_a_job_waiting_for_room_fails_it_and_its_own_job_gets_a_failing_runner_again,
         spot_pools_near_the_cheapest_in_any_region_are_asked_before_a_dearer_type_in_the_first

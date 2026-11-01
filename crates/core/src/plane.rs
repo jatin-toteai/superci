@@ -3245,6 +3245,9 @@ impl<'a> ControlPlane<'a> {
                         if a.cloud == "cloudflare" { if let Some(i) = &self.config.cloudflare_image { body["image_url"] = i.clone().into() } }
                         if let Some(g) = size.gpu { body["gpu"] = g.to_uppercase().into() }
                         let v = self.launcher_call(plane_url, &a, "/launch", with_work(body, &work)).await?;
+                        // (What it says of its own machine is believed over the formula: its price, and whether it is spot.)
+                        if let Some(p) = v["usd_per_hour"].as_f64() { job.usd_per_hour = Some(p) }
+                        if let Some(spot) = v["spot"].as_bool() { job.on_demand = !spot }
                         Ok(Tried::Started(v["id"].as_str().ok_or("launcher answered without an id")?.to_string(), v["kind"].as_str().unwrap_or_default().to_string()))
                     }.await,
                 };
