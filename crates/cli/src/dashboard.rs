@@ -5483,20 +5483,23 @@ fn remove_dialog(v: &PlaneView, cloud: &str, i: usize, signed_in: &[&str]) -> St
     let account = aws_account(v).unwrap_or_default();
     let deleted: Vec<String> = match cloud {
         "aws" => vec!["Its machines, and their network in each region".into(), if matches!(v.plane, Plane::Aws { .. }) { format!("The machines' policy on the role superci-plane-{id} (the control plane's own role stays)") } else { format!("The role superci-plane-{id} and its identity provider, in account {account}") }],
+        // (A GCP launcher is one you deployed: SuperCI made nothing there.)
+        "gcp" => vec![],
         _ if own => vec![],
         "modal" => vec![format!("The app superci-runners-{id} in your Modal workspace, and its sandboxes")],
         _ => vec![format!("The launcher superci-runners-{id} in your Cloudflare account, and its containers")],
     };
-    let what = if deleted.is_empty() { format!(r#"<p class="note">Nothing is deleted: your control plane stops starting {}.</p>"#, if cloud == "modal" { "sandboxes" } else { "containers" }) }
+    let what = if cloud == "gcp" { r#"<p class="note">Nothing is deleted: the launcher keeps running where you deployed it, and your control plane stops sending it jobs.</p>"#.to_string() }
+        else if deleted.is_empty() { format!(r#"<p class="note">Nothing is deleted: your control plane stops starting {}.</p>"#, if cloud == "modal" { "sandboxes" } else { "containers" }) }
         else { format!(r#"<p class="note">Deleted in {name}:</p><ul class="needs">{}</ul>"#, deleted.iter().map(|d| format!("<li><span>{}</span></li>", esc(d))).collect::<String>()) };
     let running = running_on(&st, cloud);
     let (stop, warn) = if running == 0 { (String::new(), String::new()) } else {
         (r#"<input type="hidden" name="stop" value="on">"#.to_string(), format!(r#"<p class="note bad-text">{running} job{} running there {}.</p>"#, if running == 1 { " is" } else { "s are" }, if own { "finish on their own" } else { "stop, and fail on GitHub" }))
     };
-    let can = own || signed_in.contains(&cloud);
+    let can = own || cloud == "gcp" || signed_in.contains(&cloud);
     let main = if can { format!(r#"<button class="button danger sm">{}</button>"#, if running > 0 && !own { format!("Stop {running} and remove") } else { "Remove".into() }) } else { String::new() };
     let signin = if can { String::new() } else { format!(r#"<div class="dlg-signin"><span class="note">Sign in with {name} to delete these.</span>{}</div>"#, signin_button(cloud, &format!("Sign in with {name}"), true)) };
-    let only = if own { String::new() } else { r#"<button class="button secondary sm" name="only" value="on">Remove from SuperCI only</button>"#.to_string() };
+    let only = if own || cloud == "gcp" { String::new() } else { r#"<button class="button secondary sm" name="only" value="on">Remove from SuperCI only</button>"#.to_string() };
     format!(r#"<dialog class="dlg" id="pool-remove-{i}" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head">{}<span><strong>Remove {}?</strong><small>Jobs stop going to {}. Your control plane and your sign-ins stay; adding it back is a click.</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>{what}{warn}{signin}<form method="post" action="/runners/remove" class="dlg-foot"><input type="hidden" name="plane" value="{}"><input type="hidden" name="cloud" value="{}">{stop}<button type="button" class="button secondary sm" style="margin-right:auto" onclick="this.closest('dialog').close()">Cancel</button>{only}{main}</form></div></dialog>"#,
         logo(&logo_key, 36), esc(&name), esc(&name), esc(id), esc(cloud))
 }
@@ -5878,6 +5881,7 @@ fn pool_caps(pool: &str) -> serde_json::Value {
         "aws" => serde_json::json!([Capacity::aws()]),
         "cloudflare" => serde_json::json!([Capacity::cloudflare()]),
         "modal" => serde_json::json!([Capacity::modal()]),
+        "gcp" => serde_json::json!([Capacity::gcp()]),
         _ => serde_json::json!([]),
     }
 }
@@ -8233,6 +8237,27 @@ mod tests {
         let words = job_words(&job("done", Some("failure")));
         assert_eq!((words["state"].as_str(), words["ended"].as_str()), (Some("done"), Some("failed")));
         assert!(job_words(&job("done", None))["ended"].is_null() && job_words(&job("failed", None))["ended"].is_null());
+    }
+
+    /// A GCP launcher is one you deployed: its removal deletes nothing, needs no sign-in, and says it keeps running.
+    #[test]
+    fn removing_a_gcp_launcher_deletes_nothing_asks_no_sign_in_and_says_it_keeps_running() {
+        let d = with_cloudflare(&[("a1", "Acme Inc.")]);
+        let plane = Plane::Cloudflare { account_id: "a1".into(), account_name: "Acme Inc.".into(), script: "superci".into(), url: "https://superci.acme.workers.dev".into(), plane_id: "p1".into(), label: "superci".into() };
+        let view = |jobs: serde_json::Value| PlaneView { plane: plane.clone(), online: true, github: true, installed: true, aws: false, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()),
+            status: Some(serde_json::json!({ "containers": true, "own_cloud": "cloudflare", "launchers": [{ "cloud": "gcp", "url": "https://launcher.example" }],
+                "routing": { "rules": [], "order": [{ "cloud": "cloudflare" }, { "cloud": "gcp" }] }, "jobs": jobs })) };
+        let dialog = |html: &str| { let end = html.find("Remove GCP?").unwrap(); let start = html[..end].rfind("<dialog").unwrap(); html[start..end + html[end..].find("</dialog>").unwrap()].to_string() };
+        let html = d.render("runners", &[view(serde_json::json!([]))], None);
+        let gcp = dialog(&html);
+        assert!(gcp.contains(r#"name="cloud" value="gcp""#) && gcp.contains("Nothing is deleted: the launcher keeps running where you deployed it, and your control plane stops sending it jobs."), "{gcp}");
+        assert!(gcp.contains(r#"<button class="button danger sm">Remove</button>"#) && !gcp.contains("Sign in") && !gcp.contains("Cloudflare") && !gcp.contains(r#"name="only""#), "{gcp}");
+        // Jobs running there: said, and the removal stops them, still with no sign-in.
+        let html = d.render("runners", &[view(serde_json::json!([{ "job_id": 7, "run_id": 70, "repo": "acme/app", "state": "running", "cloud": "gcp", "at_ms": 1 }]))], None);
+        let gcp = dialog(&html);
+        assert!(gcp.contains("1 job is running there stop, and fail on GitHub") && gcp.contains(r#"<button class="button danger sm">Stop 1 and remove</button>"#) && !gcp.contains("Sign in"), "{gcp}");
+        // The machine picker knows what a GCP launcher can run.
+        assert_eq!(pool_caps("gcp"), serde_json::json!([Capacity::gcp()]));
     }
 
     #[test]
