@@ -262,7 +262,7 @@ pub struct AwsConnection { pub account_id: String, pub region: String, pub role_
 pub struct Job {
     pub job_id: u64, pub run_id: u64, pub repo: String, pub state: String, pub at_ms: u64,
     pub runner: Option<String>, pub runner_id: Option<u64>, pub installation_id: u64,
-    /// Where it ran ("aws", "cloudflare", "modal"), the machine's id there, and its kind.
+    /// Where it ran ("aws", "cloudflare", "modal", "gcp"), the machine's id there, and its kind.
     pub cloud: String, pub machine_id: Option<String>, pub machine_type: Option<String>,
     pub error: Option<String>, pub seen_in_progress: bool,
     /// The label it asked for (`superci`, `superci/cpu=8/arch=arm64`): what machine, and what its runner registers as.
@@ -693,7 +693,7 @@ const NO_GPU_QUOTA: &str = "AWS lets this account run no GPU machines yet: ask A
 pub fn cloud_name(cloud: &str) -> &str { CLOUD_NAMES.iter().find(|(id, _)| *id == cloud).map_or(cloud, |(_, name)| *name) }
 
 /// Each cloud a job's machine can be in, as people read it.
-pub const CLOUD_NAMES: [(&str, &str); 4] = [("aws", "AWS"), (AWS_ON_DEMAND, "AWS on-demand"), ("cloudflare", "Cloudflare"), ("modal", "Modal")];
+pub const CLOUD_NAMES: [(&str, &str); 5] = [("aws", "AWS"), (AWS_ON_DEMAND, "AWS on-demand"), ("cloudflare", "Cloudflare"), ("modal", "Modal"), ("gcp", "GCP")];
 
 /// AWS's on-demand machines, as a place of their own in the order (`aws` there is its spot machines): when no region
 /// has a spot machine for a job, the job goes to the next place in the order that can run it, which may be this one.
@@ -952,9 +952,9 @@ pub fn usage_of(hours: &std::collections::BTreeMap<u64, Hour>, now: u64, step_ms
 }
 
 
-/// What a cloud's containers can be (Cloudflare's, or Modal's sandboxes): started by this control plane itself, or
-/// by a launcher.
-fn capacity_of(cloud: &str) -> Capacity { if cloud == "cloudflare" { Capacity::cloudflare() } else { Capacity::modal() } }
+/// What a cloud's containers can be (Cloudflare's, Modal's sandboxes, or GCP's machines): started by this control
+/// plane itself, or by a launcher.
+fn capacity_of(cloud: &str) -> Capacity { match cloud { "cloudflare" => Capacity::cloudflare(), "gcp" => Capacity::gcp(), _ => Capacity::modal() } }
 
 fn active(j: &Job) -> bool { ["launching", "launched", "running"].contains(&j.state.as_str()) }
 
@@ -3440,7 +3440,7 @@ impl<'a> ControlPlane<'a> {
         enum Place { Own, Launcher(Launcher), Aws(AwsConnection) }
         let mut places = vec![];
         if self.own_containers() { places.push(Place::Own) }
-        places.extend(["cloudflare", "modal"].iter().filter_map(|c| self.config.launchers.iter().find(|a| a.cloud == *c)).map(|a| Place::Launcher(a.clone())));
+        places.extend(["cloudflare", "modal", "gcp"].iter().filter_map(|c| self.config.launchers.iter().find(|a| a.cloud == *c)).map(|a| Place::Launcher(a.clone())));
         if let Ok(Some(a)) = self.aws_connection().await.map(|a| a.filter(|a| a.connected)) { places.push(Place::Aws(a)) }
         if places.is_empty() { return }
         let Some(app) = self.app_of(job) else { return };
@@ -5635,6 +5635,14 @@ mod price_tests {
     fn every_cloud_has_its_name_and_any_other_is_said_as_it_is() {
         for (id, name) in CLOUD_NAMES { assert_eq!(cloud_name(id), name) }
         assert_eq!((cloud_name("aws"), cloud_name(AWS_ON_DEMAND), cloud_name("machine")), ("AWS", "AWS on-demand", "machine"));
+        assert_eq!(cloud_name("gcp"), "GCP");
+    }
+
+    #[test]
+    fn each_launcher_cloud_has_its_own_capacity() {
+        assert_eq!(capacity_of("cloudflare"), Capacity::cloudflare());
+        assert_eq!(capacity_of("gcp"), Capacity::gcp());
+        assert_eq!(capacity_of("modal"), Capacity::modal());
     }
 
     #[test]
