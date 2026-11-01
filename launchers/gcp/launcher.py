@@ -6,6 +6,8 @@ import json
 import os
 from dataclasses import dataclass
 
+from prices import ON_DEMAND, SPOT
+
 
 @dataclass
 class Config:
@@ -88,3 +90,28 @@ def verify(authorization: str, audience: str, trust: dict, now: float) -> dict:
             raise PermissionError("token for another agent or control plane")
         return claims
     raise PermissionError("bad token")
+
+
+# The machine families a job can run on, in the order they are tried.
+FAMILIES = ("e2", "n2d", "c4d")
+SIZES = {"e2": (2, 4, 8, 16, 32), "n2d": (2, 4, 8, 16, 32, 64), "c4d": (2, 4, 8, 16, 32, 64)}  # vCPUs; e2 stops at 32
+
+
+def choose(cpu: int, ram_gb: int, families: tuple[str, ...] = FAMILIES) -> list[str]:
+    """For each family in order, the smallest standard machine type with `cpu` vCPUs and `ram_gb` GB of memory.
+
+    A standard type has 4 GB a vCPU, which is what the fit is tested against. A c4d standard type has 3.75 GB a
+    vCPU, so a job there can get up to 6 percent less memory than it asked for; that is accepted. A family with
+    no size that fits is left out, and the result is empty when none fits.
+    """
+    types = []
+    for family in families:
+        fits = [n for n in SIZES[family] if n >= cpu and n * 4 >= ram_gb]
+        if fits:
+            types.append(f"{family}-standard-{min(fits)}")
+    return types
+
+
+def price(machine_type: str, spot: bool) -> float:
+    """The hourly price in US dollars of a machine type in the price table; KeyError when it is not in it."""
+    return (SPOT if spot else ON_DEMAND)[machine_type]
