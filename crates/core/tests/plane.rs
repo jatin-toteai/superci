@@ -6870,6 +6870,28 @@ fn a_gcp_launcher_is_told_spot_and_a_notice_link_and_its_machine_can_say_it_was_
 }
 
 #[test]
+fn a_gitlab_job_on_a_gcp_launcher_is_given_a_notice_link_by_its_job_id_and_its_machine_can_say_it_was_taken_back() {
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let clouds = With(FakeClouds::default(), |r: &Request, _: &str| (r.url == "https://gcp.acme.example/launch").then(|| Response::new(200, "application/json", r#"{"id":"superci-gl1977","kind":"e2-standard-2"}"#)));
+    let mut config = Config::new(PLANE_ID.into());
+    config.gitlab = Some(superci_core::gitlab::GitLab { url: "https://gitlab.example".into(), token: "glpat-test".into(), hook_secret: "hook-secret-0123456789".into(), id: String::new() });
+    config.launchers = vec![Launcher { cloud: "gcp".into(), url: "https://gcp.acme.example".into() }];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    let job = || serde_json::from_str::<serde_json::Value>(&store.0.borrow()["job:gl1977"]).unwrap();
+    // A GitLab machine is known by its job's id, not by a runner's name (none is kept for it): its link says that.
+    run(gitlab_event(1977, "pending", "hook-secret-0123456789"));
+    let body = launch_body_of(&clouds.0, "https://gcp.acme.example/launch");
+    let token = job()["notice"].as_str().expect("a notice token").to_string();
+    assert!(token.len() >= 16 && body["spot"] == true && body["notice"] == format!("{PLANE_URL}/interrupted?gl=1977&t={token}"), "{body}");
+    // The machine says it was taken back: a wrong token is ignored; the right one marks the job interrupted.
+    assert_eq!(run(Request::new("POST", &format!("{PLANE_URL}/interrupted?gl=1977&t=wrong-wrong-wrong-wrong"))).status, 404);
+    assert_eq!(job()["interrupted"], serde_json::Value::Null);
+    assert_eq!(run(Request::new("POST", &format!("{PLANE_URL}/interrupted?gl=1977&t={token}"))).status, 200);
+    assert_eq!(job()["interrupted"], true);
+}
+
+#[test]
 fn a_runs_repository_environment_and_signing_key_are_read_as_they_are_or_said() {
     let clouds = With(FakeClouds::default(), |r: &Request, _: &str| (r.url == "https://api.github.com/repos/acme/app").then(|| Response::new(200, "application/json", r#"{"default_branch":"main"}"#)));
     let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
@@ -7066,6 +7088,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         launchers_and_failing_runners_start_where_they_can_and_say_what_they_could_not,
         a_launcher_that_says_its_price_is_believed_and_one_that_does_not_is_priced_by_formula,
         a_gcp_launcher_is_told_spot_and_a_notice_link_and_its_machine_can_say_it_was_taken_back,
+        a_gitlab_job_on_a_gcp_launcher_is_given_a_notice_link_by_its_job_id_and_its_machine_can_say_it_was_taken_back,
         a_runs_repository_environment_and_signing_key_are_read_as_they_are_or_said,
         a_failing_runner_that_takes_a_job_waiting_for_room_fails_it_and_its_own_job_gets_a_failing_runner_again,
         spot_pools_near_the_cheapest_in_any_region_are_asked_before_a_dearer_type_in_the_first

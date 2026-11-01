@@ -3252,7 +3252,8 @@ impl<'a> ControlPlane<'a> {
                         if spot_capable {
                             body["spot"] = spot.into();
                             job.notice = spot.then(|| crate::crypto::random_token(18));
-                            if let Some(t) = &job.notice { body["notice"] = format!("{plane_url}/interrupted?runner={name}&t={t}").into() }
+                            // (A GitLab job is found by its own id: no runner's name is kept for its machine.)
+                            if let Some(t) = &job.notice { body["notice"] = if gitlab { format!("{plane_url}/interrupted?gl={}&t={t}", gitlab::local(&job.gitlab, job.job_id)) } else { format!("{plane_url}/interrupted?runner={name}&t={t}") }.into() }
                         }
                         let v = self.launcher_call(plane_url, &a, "/launch", with_work(body, &work)).await?;
                         // (What it says of its own machine is believed over the formula: its price, and whether it is spot.)
