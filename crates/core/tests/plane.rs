@@ -6811,6 +6811,64 @@ fn a_launcher_that_says_its_price_is_believed_and_one_that_does_not_is_priced_by
     assert_eq!((j["usd_per_hour"].as_f64(), j["machine_id"].as_str(), j["on_demand"].as_bool().unwrap_or(false)), (Some(superci_core::plane::modal_usd_per_hour(2, 8)), Some("superci-3"), false), "{j}");
 }
 
+/// The last body sent to `url` by the control plane, as JSON.
+fn launch_body_of(clouds: &FakeClouds, url: &str) -> serde_json::Value {
+    let calls = clouds.calls.borrow();
+    let sent = calls.iter().rev().find(|c| c.1 == url).unwrap_or_else(|| panic!("nothing was sent to {url}"));
+    serde_json::from_str(&sent.2).unwrap_or_else(|e| panic!("the body sent to {url} is no JSON ({e}): {}", sent.2))
+}
+
+/// The last body sent to a launcher's `/launch` for job `n`.
+fn launch_body_of_job(clouds: &FakeClouds, n: u64) -> serde_json::Value {
+    let calls = clouds.calls.borrow();
+    calls.iter().rev().filter(|c| c.1.ends_with("/launch")).filter_map(|c| serde_json::from_str::<serde_json::Value>(&c.2).ok()).find(|b| b["job"] == n)
+        .unwrap_or_else(|| panic!("no /launch was sent for job {n}"))
+}
+
+#[test]
+fn a_gcp_launcher_is_told_spot_and_a_notice_link_and_its_machine_can_say_it_was_taken_back() {
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let clouds = With(FakeClouds::default(), |r: &Request, _: &str| (r.url == "https://gcp.acme.example/launch").then(|| Response::new(200, "application/json", r#"{"id":"superci-1","kind":"e2-standard-2"}"#)));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.launchers = vec![Launcher { cloud: "gcp".into(), url: "https://gcp.acme.example".into() }];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let interrupted = |name: &str, token: &str| block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/interrupted?runner={name}&t={token}"))));
+    // A job with the default label is asked for a spot machine, with a link only that machine has.
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci")));
+    let body = launch_body_of(&clouds.0, "https://gcp.acme.example/launch");
+    let name = body["name"].as_str().expect("a name").to_string();
+    let token = job(&store, 1)["notice"].as_str().expect("a notice token").to_string();
+    assert!(token.len() >= 16 && body["spot"] == true && body["notice"] == format!("{PLANE_URL}/interrupted?runner={name}&t={token}"), "{body}");
+    // The machine says it was taken back: a wrong token is ignored; the right one marks the job interrupted.
+    assert_eq!(interrupted(&name, "wrong").status, 404);
+    assert_eq!(job(&store, 1)["interrupted"], serde_json::Value::Null);
+    assert_eq!(interrupted(&name, &token).status, 200);
+    assert_eq!(job(&store, 1)["interrupted"], true);
+    // A label that says spot=false: an on-demand machine, with no link, and a notice for it is ignored whatever its token.
+    block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/spot=false")));
+    let body2 = launch_body_of_job(&clouds.0, 2);
+    let name2 = body2["name"].as_str().expect("a name").to_string();
+    assert!(body2["spot"] == false && body2.get("notice").is_none() && job(&store, 2)["notice"].is_null(), "{body2}");
+    assert_eq!(interrupted(&name2, "anything").status, 404);
+    assert_eq!(job(&store, 2)["interrupted"], serde_json::Value::Null);
+    // A job run again after its spot machine was taken back is kept off spot machines: the same.
+    store.0.borrow_mut().insert("rerun:acme/app:3:".into(), "1".into());
+    block_on(plane.handle(labelled("queued", 3, "acme/app", None, "superci")));
+    let body3 = launch_body_of_job(&clouds.0, 3);
+    assert!(job(&store, 3)["after_reclaim"] == true && body3["spot"] == false && body3.get("notice").is_none() && job(&store, 3)["notice"].is_null(), "{body3}");
+    // Another launcher's body says nothing of spot.
+    let (store, cache) = (Mem::default(), Cache::default());
+    let clouds = With(FakeClouds::default(), |r: &Request, _: &str| (r.url == "https://modal.acme.example/launch").then(|| Response::new(200, "application/json", r#"{"id":"sb-1","kind":"sandbox"}"#)));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.launchers = vec![Launcher { cloud: "modal".into(), url: "https://modal.acme.example".into() }];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(labelled("queued", 4, "acme/app", None, "superci")));
+    let body4 = launch_body_of(&clouds.0, "https://modal.acme.example/launch");
+    assert!(body4.get("spot").is_none() && body4.get("notice").is_none() && job(&store, 4)["notice"].is_null(), "{body4}");
+}
+
 #[test]
 fn a_runs_repository_environment_and_signing_key_are_read_as_they_are_or_said() {
     let clouds = With(FakeClouds::default(), |r: &Request, _: &str| (r.url == "https://api.github.com/repos/acme/app").then(|| Response::new(200, "application/json", r#"{"default_branch":"main"}"#)));
@@ -7007,6 +7065,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         machines_whose_jobs_went_elsewhere_hand_themselves_on_or_end_as_github_and_gitlab_say,
         launchers_and_failing_runners_start_where_they_can_and_say_what_they_could_not,
         a_launcher_that_says_its_price_is_believed_and_one_that_does_not_is_priced_by_formula,
+        a_gcp_launcher_is_told_spot_and_a_notice_link_and_its_machine_can_say_it_was_taken_back,
         a_runs_repository_environment_and_signing_key_are_read_as_they_are_or_said,
         a_failing_runner_that_takes_a_job_waiting_for_room_fails_it_and_its_own_job_gets_a_failing_runner_again,
         spot_pools_near_the_cheapest_in_any_region_are_asked_before_a_dearer_type_in_the_first

@@ -3244,6 +3244,16 @@ impl<'a> ControlPlane<'a> {
                         let mut body = serde_json::json!({ "name": name, "job": job.job_id, "repo": job.repo, "max_minutes": self.machine_minutes(&a.cloud), "cpu": size.cpu, "ram_gb": size.ram_gb, "disk_gb": size.disk_gb, "location": self.config.cloudflare_location });
                         if a.cloud == "cloudflare" { if let Some(i) = &self.config.cloudflare_image { body["image_url"] = i.clone().into() } }
                         if let Some(g) = size.gpu { body["gpu"] = g.to_uppercase().into() }
+                        // A launcher whose cloud has spot machines is told whether this one is spot (not when the label asks for
+                        // on-demand, nor for a job run again after its spot machine was taken back), and, for a spot one, where
+                        // to say when it is taken back: a link only that machine has, as AWS's spot machines have.
+                        let spot_capable = a.cloud == "gcp";
+                        let spot = spot_capable && !spec.on_demand() && !job.no_spot;
+                        if spot_capable {
+                            body["spot"] = spot.into();
+                            job.notice = spot.then(|| crate::crypto::random_token(18));
+                            if let Some(t) = &job.notice { body["notice"] = format!("{plane_url}/interrupted?runner={name}&t={t}").into() }
+                        }
                         let v = self.launcher_call(plane_url, &a, "/launch", with_work(body, &work)).await?;
                         // (What it says of its own machine is believed over the formula: its price, and whether it is spot.)
                         if let Some(p) = v["usd_per_hour"].as_f64() { job.usd_per_hour = Some(p) }
