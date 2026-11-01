@@ -6892,6 +6892,35 @@ fn a_gitlab_job_on_a_gcp_launcher_is_given_a_notice_link_by_its_job_id_and_its_m
 }
 
 #[test]
+fn a_launcher_saying_no_room_makes_the_job_wait_and_the_sweep_tries_again() {
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let full = std::cell::Cell::new(true);
+    let clouds = With(FakeClouds::default(), |r: &Request, _: &str| (r.url == "https://gcp.acme.example/launch").then(|| if full.get() {
+        Response::new(429, "application/json", r#"{"detail":"no spot room in us-west4 (ZONE_RESOURCE_POOL_EXHAUSTED in every zone)"}"#)
+    } else { Response::new(200, "application/json", r#"{"id":"superci-1","kind":"e2-standard-2","usd_per_hour":0.0104,"spot":true}"#) }));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.launchers = vec![Launcher { cloud: "gcp".into(), url: "https://gcp.acme.example".into() }];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    // No room: the job waits, with no start counted as failed and nothing held against the launcher's place.
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci")));
+    let j = job(&store, 1);
+    assert_eq!((j["state"].as_str(), j["retries"].as_u64().unwrap_or(0)), (Some("waiting"), 0), "{j}");
+    assert!(j["error"].as_str().unwrap().starts_with("waiting: no spot room in us-west4"), "{j}");
+    assert!(j["failed_at"].as_array().map_or(true, |a| a.is_empty()), "{j}");
+    assert_eq!(wakes.0.borrow().last().copied(), Some(20_000));
+    // Still full at the next sweep: still waiting, still no retry counted.
+    block_on(plane.alarm()).unwrap();
+    let j = job(&store, 1);
+    assert_eq!((j["state"].as_str(), j["retries"].as_u64().unwrap_or(0)), (Some("waiting"), 0), "{j}");
+    assert!(j["failed_at"].as_array().map_or(true, |a| a.is_empty()), "{j}");
+    // Room again: the sweep starts it.
+    full.set(false);
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(job(&store, 1)["state"], "launched");
+}
+
+#[test]
 fn a_runs_repository_environment_and_signing_key_are_read_as_they_are_or_said() {
     let clouds = With(FakeClouds::default(), |r: &Request, _: &str| (r.url == "https://api.github.com/repos/acme/app").then(|| Response::new(200, "application/json", r#"{"default_branch":"main"}"#)));
     let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
@@ -7089,6 +7118,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_launcher_that_says_its_price_is_believed_and_one_that_does_not_is_priced_by_formula,
         a_gcp_launcher_is_told_spot_and_a_notice_link_and_its_machine_can_say_it_was_taken_back,
         a_gitlab_job_on_a_gcp_launcher_is_given_a_notice_link_by_its_job_id_and_its_machine_can_say_it_was_taken_back,
+        a_launcher_saying_no_room_makes_the_job_wait_and_the_sweep_tries_again,
         a_runs_repository_environment_and_signing_key_are_read_as_they_are_or_said,
         a_failing_runner_that_takes_a_job_waiting_for_room_fails_it_and_its_own_job_gets_a_failing_runner_again,
         spot_pools_near_the_cheapest_in_any_region_are_asked_before_a_dearer_type_in_the_first

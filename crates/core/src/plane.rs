@@ -3418,6 +3418,15 @@ impl<'a> ControlPlane<'a> {
                 self.keep(&key, &*job).await?;
                 return self.timer.wake_in(30_000).await;
             }
+            // A launcher answered 429: its cloud has no room for the machine now. That is no start that failed: the job
+            // waits and the sweep asks again (no retry is counted, and the place is not held against the launcher).
+            if let Some((_, said)) = e.split_once(" launcher: 429 ") {
+                job.failed_at.retain(|p| !e.contains(&format!("{p} launcher: 429 ")));
+                job.state = "waiting".into();
+                job.error = Some(format!("waiting: {}", said.chars().take(280).collect::<String>()));
+                self.keep(&key, &*job).await?;
+                return self.timer.wake_in(20_000).await;
+            }
             // A place was picked and starting the machine failed (Cloudflare "temporarily unavailable", a spot shortage):
             // tried again, twice; GitHub would otherwise keep the job queued for a day. No place for it: failed at once.
             // (Not what AWS's budget stopped: trying again changes nothing until the rule is lifted. Said at once.)
