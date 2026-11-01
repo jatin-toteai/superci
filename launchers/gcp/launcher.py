@@ -4,7 +4,9 @@
 import base64
 import json
 import os
+import re
 from dataclasses import dataclass
+from pathlib import Path
 
 from prices import ON_DEMAND, SPOT
 
@@ -116,3 +118,63 @@ def choose(cpu: int, ram_gb: int, families: tuple[str, ...] = FAMILIES) -> list[
 def price(machine_type: str, spot: bool) -> float:
     """The hourly price in US dollars of a machine type in the price table; KeyError when it is not in it."""
     return (SPOT if spot else ON_DEMAND)[machine_type]
+
+
+def instance_name(runner: str) -> str:
+    """A GCE instance name for a runner name: lowercase letters, digits and `-`, starting with a letter, at most 63
+    characters, not ending in `-`. The same runner name always gives the same instance name."""
+    name = re.sub(r"[^a-z0-9-]", "-", runner.lower())
+    if not name[:1].isalpha():
+        name = "r-" + name
+    return name[:63].rstrip("-")
+
+
+# What the job VM runs at boot: GitHub's runner for one job, then power off. `startup.sh.tmpl` is the script; these
+# are the two optional parts that `render_startup` puts in it.
+
+# GCE's metadata server answers `preempted?wait_for_change=true` when the value changes, to TRUE as the VM is taken
+# back (30 seconds before it is stopped). The plane is told once, in the background, from before the runner starts.
+_NOTICE_WATCHER = """# Told to the control plane when GCE takes this VM back.
+( until [ "$(curl -s -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/preempted?wait_for_change=true')" = TRUE ]; do sleep 1; done
+  curl -s -X POST __NOTICE__ ) &"""
+
+# A failing runner's job-started hook says why (base64, as the control plane wrote it) and fails the job before any
+# step, as `runner_command` in the Modal launcher does. `RUNNER_ENV` is the setting the runner's command line gets (`sudo` would drop an exported one).
+_FAIL_HOOK = """# This runner only says why its job fails.
+printf '#!/bin/bash\\necho __WHY__ | base64 -d\\nexit 1\\n' > /tmp/superci-fail.sh && chmod 755 /tmp/superci-fail.sh
+RUNNER_ENV=ACTIONS_RUNNER_HOOK_JOB_STARTED=/tmp/superci-fail.sh"""
+
+_BASE64 = re.compile(r"[A-Za-z0-9+/=]+")
+
+
+def _quoted(text: str) -> str:
+    """`text` as one word for a shell, in single quotes."""
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
+def render_startup(jit: str, fail: str | None, max_minutes: int, notice: str | None, runner_version: str) -> str:
+    """The startup script of a job VM.
+
+    `jit` is the runner's JIT configuration and `fail` (when the runner is only to fail its job) the reason, both
+    base64 and ValueError otherwise, as they are put on a command line. The VM powers off after `max_minutes`
+    whatever happens. `notice`, a link, is posted to once when GCE preempts the VM; none for an on-demand VM.
+    `runner_version` is what the image's runner is expected to be: logged with the installed one.
+    """
+    if not _BASE64.fullmatch(jit):
+        raise ValueError("the runner configuration is not base64")
+    if fail is not None and not _BASE64.fullmatch(fail):
+        raise ValueError("the failing runner's reason is not base64")
+    if max_minutes < 1:
+        raise ValueError("the time bound is under a minute")
+    watcher = _NOTICE_WATCHER.replace("__NOTICE__", _quoted(notice)) if notice is not None else ""
+    hook = _FAIL_HOOK.replace("__WHY__", fail) if fail is not None else ""
+    template = Path(__file__).with_name("startup.sh.tmpl").read_text()
+    # (A part left out leaves no blank line.) One pass over the template, so no inserted text is searched for placeholders.
+    parts = {
+        "__MAX_MINUTES__": str(max_minutes),
+        "__RUNNER_VERSION__": _quoted(runner_version),
+        "__JIT__": jit,
+        "__NOTICE_WATCHER__\n": watcher + "\n" if watcher else "",
+        "__FAIL_HOOK__\n": hook + "\n" if hook else "",
+    }
+    return re.sub("|".join(map(re.escape, parts)), lambda found: parts[found.group()], template)
