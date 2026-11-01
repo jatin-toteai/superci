@@ -2749,7 +2749,7 @@ impl Dashboard {
                 // The control plane the dialog was shown for (another may be in use since).
                 if form_has("plane") && field("plane") != plane.plane_id() { return Ok(message(409, "Another control plane is in use now", "Open Runners again and remove it there.")) }
                 let cloud = field("cloud");
-                if !["aws", "cloudflare", "modal"].contains(&cloud.as_str()) { return Ok(message(400, "Unknown provider", "")) }
+                if !["aws", "cloudflare", "modal", "gcp"].contains(&cloud.as_str()) { return Ok(message(400, "Unknown provider", "")) }
                 let only = field("only") == "on";
                 let Some(status) = status_soon(plane.url(), &self.status_key) else {
                     return Ok(message(503, "The control plane did not answer yet", "It is starting with a new setting. Try again in a few seconds."))
@@ -2770,6 +2770,8 @@ impl Dashboard {
                     let signed_in = match cloud.as_str() {
                         "aws" => account.as_ref().is_some_and(|a| self.hold_account(a)),
                         _ if own_containers => true,
+                        // (A GCP launcher is one you deployed: SuperCI made nothing there to delete.)
+                        "gcp" => true,
                         "modal" => self.modal.is_some(),
                         _ => self.cf.is_some(),
                     };
@@ -2806,6 +2808,7 @@ impl Dashboard {
                 let id = plane.plane_id().to_string();
                 let mut left = vec![];
                 match (cloud.as_str(), only, &aws_creds, &cf, &md) {
+                    ("gcp", ..) => left.push("the launcher itself, which you deployed: SuperCI does not stop it".into()),
                     (_, _, Some(creds), _, _) => {
                         // What lets the control plane start machines goes first: none can start after, whether or
                         // not it has taken the change yet. Then its machines and their network, once more if a
@@ -3419,6 +3422,24 @@ impl Dashboard {
                 launchers.push(superci_core::plane::Launcher { cloud: "modal".into(), url });
                 self.put_secret(&plane, "LAUNCHERS", &json_text(&launchers))?;
                 wait_for(plane.url(), &self.status_key, |s| s["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "modal")));
+                Ok(Response::redirect("/?p=runners"))
+            }
+            // A GCP launcher is run by you (a small agent on Cloud Run, or on a machine of yours): it is added by its
+            // address, once that answers as one. Nothing of it is made here, so no sign-in is needed.
+            ("POST", "/runners/gcp") => {
+                let plane = self.plane()?;
+                let url = field("url").trim_end_matches('/').to_string();
+                if !(url.starts_with("https://") || superci_core::io::local_test_address(&url)) || url.contains(char::is_whitespace) {
+                    return Ok(message(400, "A launcher's address starts with https://", "Nothing has changed."))
+                }
+                if let Err(said) = launcher_answers_as(&url, "gcp", "GCP") { return Ok(message(400, "That address is not a GCP launcher", &esc(&said))) }
+                let Some(mut launchers) = status_soon(plane.url(), &self.status_key).and_then(|s| serde_json::from_value::<Vec<superci_core::plane::Launcher>>(s["launchers"].clone()).ok()) else {
+                    return Ok(message(503, "The control plane did not answer yet", "It is starting with a new setting. Try again in a few seconds."))
+                };
+                launchers.retain(|a| a.cloud != "gcp");
+                launchers.push(superci_core::plane::Launcher { cloud: "gcp".into(), url });
+                self.put_secret(&plane, "LAUNCHERS", &json_text(&launchers))?;
+                wait_for(plane.url(), &self.status_key, |s| s["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "gcp")));
                 Ok(Response::redirect("/?p=runners"))
             }
             ("POST", "/runners/cloudflare") => {
@@ -5704,7 +5725,7 @@ fn section_title(section: &str) -> &'static str { SECTION_TITLES.iter().find(|(k
 
 
 /// Each place a job can run, as the dashboard names it.
-const CLOUD_NAMES: [(&str, &str); 5] = [("aws", "AWS"), (AWS_ON_DEMAND, "AWS on-demand"), ("cloudflare", "Cloudflare"), ("modal", "Modal"), ("machine", "Your computer")];
+const CLOUD_NAMES: [(&str, &str); 6] = [("aws", "AWS"), (AWS_ON_DEMAND, "AWS on-demand"), ("cloudflare", "Cloudflare"), ("modal", "Modal"), ("gcp", "GCP"), ("machine", "Your computer")];
 
 fn cloud_name(cloud: &str) -> &str { named(&CLOUD_NAMES, cloud) }
 
@@ -5807,7 +5828,7 @@ fetch('/routing'+(qs?'?'+qs:''),{method:'POST',body:body,credentials:'same-origi
 
 /// A pool's name in the order: a cloud.
 fn pool_name_ok(name: &str) -> bool {
-    ["aws", AWS_ON_DEMAND, "cloudflare", "modal"].contains(&name)
+    ["aws", AWS_ON_DEMAND, "cloudflare", "modal", "gcp"].contains(&name)
 }
 
 /// One numbered step of Set up: its number (a check once done), its title and what it says or offers.
@@ -7299,6 +7320,20 @@ fn plane_keys(url: &str) -> Result<serde_json::Value> {
 
 /// Until a launcher just deployed answers (its first answer can take a few seconds: a cold start).
 fn launcher_up(url: &str) { tries(20, 3000, || ureq::get(&crate::aws::stand_in(&format!("{url}/health"))).call().ok().filter(|r| r.status() == 200)); }
+
+/// Whether an address typed by hand answers `GET /health` as a launcher of `agent` does (200 with `{"agent":"gcp"}`),
+/// asked once (a launcher just deployed is waited for instead: `launcher_up`). When it does not, what it answered.
+fn launcher_answers_as(url: &str, agent: &str, name: &str) -> std::result::Result<(), String> {
+    let health = format!("{url}/health");
+    let expected = format!(r#" A {name} launcher answers 200 with {{"agent":"{agent}"}}. Nothing has changed."#);
+    let mut answer = ureq::get(&crate::aws::stand_in(&health)).config().http_status_as_error(false).timeout_global(Some(Duration::from_secs(10))).build().call()
+        .map_err(|e| format!("{health} did not answer ({e}).{expected}"))?;
+    let status = answer.status().as_u16();
+    if status != 200 { return Err(format!("{health} answered {status}.{expected}")) }
+    let body: serde_json::Value = answer.body_mut().read_json().map_err(|_| format!("{health} answered 200 with something that is not JSON.{expected}"))?;
+    if body["agent"] == agent { return Ok(()) }
+    Err(format!("{health} answered 200 with {}.{expected}", body.to_string().chars().take(120).collect::<String>()))
+}
 
 /// The manifest flow's last step, from this machine: the code becomes the App's id, key and webhook secret.
 /// The manifest flow's last step, from this machine: GitHub's code becomes the App's id, key and webhook secret.
@@ -9588,7 +9623,7 @@ mod rest_tests {
     fn everything_that_changes_a_control_plane_needs_one_first() {
         let mut d = Dashboard::new();
         for path in ["/runners/aws-own", "/runners/remove", "/runners/modal-own", "/gitlab/connect", "/gitlab/project", "/gitlab/disconnect", "/github/start", "/github/remove", "/aws/connect",
-            "/runners/modal", "/runners/cloudflare", "/labels", "/name", "/machine", "/routing", "/run/cancel", "/caches/delete", "/plane/update"] {
+            "/runners/modal", "/runners/cloudflare", "/runners/gcp", "/labels", "/name", "/machine", "/routing", "/run/cancel", "/caches/delete", "/plane/update"] {
             assert_eq!(send(&mut d, path, &[]).err().as_deref(), Some("no control plane yet"), "{path}");
         }
         assert_eq!(send(&mut d, "/plane/leave", &[("confirm", "superci")]).err().as_deref(), Some("no control plane yet"));
@@ -9832,6 +9867,46 @@ mod rest_tests {
         d.cf_accounts = vec![("a1".into(), "Acme".into()), ("a2".into(), "Globex".into())];
         let r = send(&mut d, "/runners/cloudflare", &[]).unwrap();
         assert!(r.status == 409 && words_of(&r).contains("Your Cloudflare sign-in reaches 2: Acme (a1), Globex (a2)."), "{}", words_of(&r));
+    }
+
+    /// A launcher run by hand is added by its address: one that is not https://, or that nothing answers at, is said.
+    #[test]
+    fn a_gcp_launchers_address_is_https_and_something_answers_there() {
+        let mut d = Dashboard::new();
+        d.planes = vec![modal_plane("p2", NOWHERE)];
+        // An address that is not https:// (or has a space in it) is refused before anything is asked of it.
+        for url in ["", "launcher.example", "http://launcher.example", "https://launcher example"] {
+            let r = send(&mut d, "/runners/gcp", &[("url", url)]).unwrap();
+            assert!(r.status == 400 && words_of(&r).contains("A launcher's address starts with https://") && words_of(&r).contains("Nothing has changed."), "{url}: {}", words_of(&r));
+        }
+        // Nothing listening there: said, with what a GCP launcher answers, and nothing is written.
+        let r = send(&mut d, "/runners/gcp", &[("url", NOWHERE)]).unwrap();
+        let words = words_of(&r);
+        assert!(r.status == 400 && words.contains("That address is not a GCP launcher") && words.contains(&format!("{NOWHERE}/health did not answer")) && words.contains(r#"A GCP launcher answers 200 with {"agent":"gcp"}"#), "{words}");
+    }
+
+    /// A launcher run by hand is added once its address answers as a GCP launcher does; what else it answers is said.
+    #[test]
+    fn a_gcp_launcher_is_added_by_its_address_once_it_answers_as_one() {
+        let launcher = |status: u16, body: &'static str| serving(move |_, path, _| if path == "/health" { (status, body.to_string()) } else { (404, "{}".to_string()) });
+        let mut d = modal_answering(serde_json::json!({ "launchers": [{ "cloud": "modal", "url": "https://acme--superci-runners-p2.modal.run" }] }));
+        // What an address answers instead of {"agent":"gcp"} is said, and nothing is written: another launcher, no
+        // agent, something that is not JSON, a refusal, nothing there.
+        for (url, says) in [
+            (launcher(200, r#"{"agent":"modal"}"#), r#"answered 200 with {"agent":"modal"}"#),
+            (launcher(200, r#"{"ok":true}"#), r#"answered 200 with {"ok":true}"#),
+            (launcher(200, "<html>hello</html>"), "answered 200 with something that is not JSON"),
+            (launcher(503, r#"{"detail":"starting"}"#), "answered 503"),
+            (launcher(404, ""), "answered 404"),
+        ] {
+            let r = send(&mut d, "/runners/gcp", &[("url", &url)]).unwrap();
+            let words = words_of(&r);
+            assert!(r.status == 400 && words.contains("That address is not a GCP launcher") && words.contains(says) && words.contains(r#"A GCP launcher answers 200 with {"agent":"gcp"}"#) && words.contains("Nothing has changed."), "{says}: {words}");
+        }
+        // One that answers as a GCP launcher is added (its trailing slash dropped): the write to the control plane is
+        // where this stops, with no sign-in to Modal.
+        let up = launcher(200, r#"{"agent":"gcp"}"#);
+        assert_eq!(send(&mut d, "/runners/gcp", &[("url", &format!("{up}/"))]).err().as_deref(), Some("Sign in with Modal first."));
     }
 
     #[test]
