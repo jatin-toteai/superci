@@ -99,10 +99,12 @@ def _run(tmp_path, fail, notice, expected="2.330.0"):
         path.write_text("#!/bin/bash\n" + body)
         path.chmod(path.stat().st_mode | stat.S_IEXEC)
 
-    # The metadata server answers TRUE after a moment; the plane's link is recorded when it is posted to.
+    # The metadata server answers TRUE only once the runner has started, as in production, where the value changes at
+    # preemption, while the job runs: a watcher that blocks the script before the runner starts never sees it. (Until
+    # then it answers FALSE, after three seconds of holding the request.) The plane's link is recorded when posted to.
     stub(bin_dir / "curl", f'''case "$*" in
-  *instance/preempted*) sleep 0.2; echo TRUE;;
-  *) echo "$*" >> {tmp_path}/posted;;
+  *instance/preempted*) for i in $(seq 30); do [ -e {tmp_path}/runner-args ] && echo TRUE && exit; sleep 0.1; done; echo FALSE;;
+  *) echo "$*" >> {tmp_path}/posted; echo posted >> {tmp_path}/events;;
 esac
 ''')
     stub(bin_dir / "sudo", 'while [ "$1" != -H ]; do shift; done; shift; exec "$@"\n')  # sudo -u runner -H ...
@@ -113,6 +115,7 @@ esac
     wait = "yes" if notice else ""
     stub(home / "run.sh", f'''if [ "$1" = --version ]; then echo 2.330.0; exit; fi
 echo "$*" > {tmp_path}/runner-args
+echo runner-started >> {tmp_path}/events
 echo "${{ACTIONS_RUNNER_HOOK_JOB_STARTED-unset}}" > {tmp_path}/runner-hook
 [ -z "${{ACTIONS_RUNNER_HOOK_JOB_STARTED}}" ] || "${{ACTIONS_RUNNER_HOOK_JOB_STARTED}}" > {tmp_path}/hook-said
 [ -z "{wait}" ] || for i in $(seq 50); do [ -e {tmp_path}/posted ] && break; sleep 0.1; done
@@ -123,7 +126,10 @@ echo runner-ended >> {tmp_path}/events
     script = script.replace("exec > >(tee /var/log/superci.log > /dev/console) 2>&1", f"exec > {tmp_path}/log 2>&1")
     for real, fake in (("/home/runner", str(home)), ("/tmp/superci-fail.sh", str(tmp_path / "fail.sh"))):
         script = script.replace(real, fake)
-    done = subprocess.run(["bash", "-c", script], env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}, capture_output=True, text=True, timeout=30)
+    try:
+        done = subprocess.run(["bash", "-c", script], env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}, capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        pytest.fail("the script never got past its watcher to start the runner: the watcher must run in the background")
     assert done.returncode == 0, done.stderr
     return lambda name: (tmp_path / name).read_text() if (tmp_path / name).exists() else None
 
@@ -133,12 +139,12 @@ def test_running_a_spot_script_posts_the_notice_once_while_the_runner_runs(tmp_p
     assert seen("shutdown").strip() == "-h +70"
     assert seen("runner-args").strip() == "--jitconfig QUJD" and seen("runner-hook").strip() == "unset"
     assert seen("posted").splitlines() == [f"-s -X POST {NOTICE}"]
-    assert seen("events").splitlines() == ["runner-ended", "poweroff"]
+    assert seen("events").splitlines() == ["runner-started", "posted", "runner-ended", "poweroff"]  # posted while the runner ran
 
 
 def test_running_a_plain_script_posts_nothing(tmp_path):
     seen = _run(tmp_path, None, None)
-    assert seen("posted") is None and seen("events").splitlines() == ["runner-ended", "poweroff"]
+    assert seen("posted") is None and seen("events").splitlines() == ["runner-started", "runner-ended", "poweroff"]
 
 
 def test_a_failing_runner_is_started_with_a_hook_that_says_why_and_fails(tmp_path):
