@@ -1254,7 +1254,7 @@ impl<'a> ControlPlane<'a> {
                 }
                 // What the machine runs with this answer: the reason, in the job's own log on GitHub, where it is
                 // otherwise only "The runner has received a shutdown signal" (a GitHub job: GitLab's says its own).
-                let said = if !j.gitlab.is_empty() || q.contains_key("gl") { String::new() } else if j.provider == "local" { aws::reclaim_said("SuperCI starts the job again by itself at once, off spot machines.") } else { aws::reclaim_said("SuperCI runs the job again by itself, off spot machines, once its run has finished.") };
+                let said = if !j.gitlab.is_empty() || q.contains_key("gl") { String::new() } else if j.provider == "local" { aws::reclaim_said(&j.cloud, "SuperCI starts the job again by itself at once, off spot machines.") } else { aws::reclaim_said(&j.cloud, "SuperCI runs the job again by itself, off spot machines, once its run has finished.") };
                 Ok(Response::new(200, "text/x-shellscript", said))
             }
             // A machine saying how its own start went (see `MachineStart`): with its link, and only what it may say.
@@ -2113,7 +2113,8 @@ impl<'a> ControlPlane<'a> {
                             put_json(self.store, &rerun_key(&project, ev.pipeline_id, &ev.name), &now).await?;
                             let asked = gitlab::retry_job(self.http, gl, ev.project_id, ev.job_id).await;
                             if asked.is_err() { self.store.delete(&rerun_key(&project, ev.pipeline_id, &ev.name)).await?; }
-                            j.error = Some(match &asked { Ok(()) => "AWS took back its spot machine; SuperCI ran the job again by itself, off spot machines".to_string(), Err(e) => format!("AWS took back its spot machine; not run again: {e}").chars().take(300).collect() });
+                            let cloud = cloud_name(&j.cloud);
+                            j.error = Some(match &asked { Ok(()) => format!("{cloud} took back its spot machine; SuperCI ran the job again by itself, off spot machines"), Err(e) => format!("{cloud} took back its spot machine; not run again: {e}").chars().take(300).collect() });
                             j.rerun = Some(Rerun { job_id: ev.job_id, run_id: ev.pipeline_id, repo: ev.project.clone(), name: ev.name.clone(), state: if asked.is_ok() { "asked".into() } else { "not run again".into() }, at_ms: now });
                         }
                         self.settle(plane_url, &mut j).await;
@@ -2356,7 +2357,8 @@ impl<'a> ControlPlane<'a> {
             None
         }.await;
         let Some(state) = settled else { return false };
-        j.error = Some(if state == "asked" { "AWS took back its spot machine; SuperCI ran the job again by itself, off spot machines (the run's next attempt)".into() } else { format!("AWS took back its spot machine; {state}") });
+        let cloud = cloud_name(&j.cloud);
+        j.error = Some(if state == "asked" { format!("{cloud} took back its spot machine; SuperCI ran the job again by itself, off spot machines (the run's next attempt)") } else { format!("{cloud} took back its spot machine; {state}") });
         r.state = state;
         j.rerun = Some(r);
         true
@@ -4141,7 +4143,8 @@ impl<'a> ControlPlane<'a> {
                     j["state"] = "pending".into();
                     j["off_spot"] = true.into();
                     // (Its first attempt, said with the run: its job, and why it is started again.)
-                    j["restarted"] = serde_json::json!({ "job_id": j["job_id"].clone(), "why": "AWS took back its spot machine" });
+                    let cloud = record.as_ref().map_or("", |r| cloud_name(&r.cloud));
+                    j["restarted"] = serde_json::json!({ "job_id": j["job_id"].clone(), "why": format!("{cloud} took back its spot machine") });
                     let o = j.as_object_mut().expect("an object: its fields were just set");
                     o.remove("job_id");
                     o.remove("token");
@@ -4705,10 +4708,11 @@ impl<'a> ControlPlane<'a> {
             // (A run from a computer's is started again by its run, at once: see `advance_run`.)
             if j.interrupted && j.rerun.is_none() && !matches!(ev.conclusion.as_deref(), Some("success" | "skipped" | "neutral")) {
                 j.state = "failed".into();
+                let cloud = cloud_name(&j.cloud);
                 if j.provider == "local" {
-                    j.error = Some("AWS took back its spot machine; SuperCI starts the job again by itself, off spot machines".into());
+                    j.error = Some(format!("{cloud} took back its spot machine; SuperCI starts the job again by itself, off spot machines"));
                 } else {
-                    j.error = Some("AWS took back its spot machine; SuperCI runs the job again by itself, off spot machines, once its run has finished (GitHub runs a job again only then)".into());
+                    j.error = Some(format!("{cloud} took back its spot machine; SuperCI runs the job again by itself, off spot machines, once its run has finished (GitHub runs a job again only then)"));
                     j.rerun = Some(Rerun { job_id, run_id: ev.run_id, repo: ev.repo.clone(), name: ev.name.clone(), state: "pending".into(), at_ms: self.clock.now_ms() });
                     self.timer.wake_in(60_000).await?;
                 }

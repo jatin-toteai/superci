@@ -6845,6 +6845,13 @@ fn a_gcp_launcher_is_told_spot_and_a_notice_link_and_its_machine_can_say_it_was_
     assert_eq!(job(&store, 1)["interrupted"], serde_json::Value::Null);
     assert_eq!(interrupted(&name, &token).status, 200);
     assert_eq!(job(&store, 1)["interrupted"], true);
+    // What the machine runs with the answer, and the job's record once its job has failed: both name GCP, not AWS.
+    let said = String::from_utf8(interrupted(&name, &token).body).unwrap();
+    assert!(said.contains("::error title=SuperCI::GCP is taking this spot machine back (thirty seconds’ notice). SuperCI runs the job again by itself, off spot machines, once its run has finished."), "{said}");
+    block_on(plane.handle(labelled("in_progress", 1, "acme/app", Some(&name), "superci")));
+    block_on(plane.handle(labelled("completed", 1, "acme/app", Some(&name), "superci")));
+    let j = job(&store, 1);
+    assert!(j["error"].as_str().is_some_and(|e| e.starts_with("GCP took back its spot machine; SuperCI runs the job again by itself, off spot machines")), "{j}");
     // A label that says spot=false: an on-demand machine, with no link, and a notice for it is ignored whatever its token.
     block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/spot=false")));
     let body2 = launch_body_of_job(&clouds.0, 2);
