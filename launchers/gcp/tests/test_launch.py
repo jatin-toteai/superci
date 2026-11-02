@@ -77,7 +77,7 @@ def test_the_fallback_starts_an_on_demand_vm_of_the_first_type_in_the_first_zone
     assert len(fc.inserted) == 10  # the nine spot pairs, then this
     last = fc.inserted[-1]
     assert last["zone"] == "us-west4-a" and last["body"]["machineType"].endswith("/e2-standard-2")
-    assert "provisioningModel" not in last["body"]["scheduling"]
+    assert last["body"]["scheduling"] == {"onHostMaintenance": "MIGRATE", "automaticRestart": False}
     assert "instance/preempted" not in startup_script(last["body"])  # an on-demand VM has no notice to give
     assert metadata_keys(last["body"]) == ["startup-script"] and metadata_keys(fc.inserted[0]["body"]) == ["startup-script", "shutdown-script"]
     assert launch(REQ, fc, cfg, clock()) == a and len(fc.inserted) == 10  # asked again, it is the same VM, still on demand
@@ -320,7 +320,8 @@ def test_spot_false_makes_an_on_demand_vm_with_no_notice(cfg):
     a = launch({**REQ, "spot": False}, fc, cfg, clock())
     assert a == {"id": ID, "kind": "e2-standard-2", "usd_per_hour": 0.0755, "spot": False}
     body = fc.inserted[0]["body"]
-    assert body["scheduling"] == {"onHostMaintenance": "TERMINATE"}
+    # (An on-demand VM is moved live when its host is maintained, and is not restarted: a spot VM cannot be moved and is stopped.)
+    assert body["scheduling"] == {"onHostMaintenance": "MIGRATE", "automaticRestart": False}
     assert body["networkInterfaces"][0]["nicType"] == "GVNIC"
     script = startup_script(body)
     assert "instance/preempted" not in script and NOTICE not in script

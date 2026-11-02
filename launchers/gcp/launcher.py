@@ -351,9 +351,12 @@ def _vm_body(cfg: Config, ask: _Ask, zone: str, kind: str, spot: bool, script: s
     interface = {"subnetwork": subnet_path(cfg), "nicType": "GVNIC"}  # (c4d takes gVNIC only; e2 and n2d support it, and the image has the driver)
     if cfg.external_address:  # path A; path B's VMs have Cloud NAT instead
         interface["accessConfigs"] = [{"type": "ONE_TO_ONE_NAT"}]
-    scheduling = {"onHostMaintenance": "TERMINATE"}
+    # A spot VM cannot be moved live when its host is maintained, so it is stopped (and deleted); an on-demand VM is moved. Neither
+    # is restarted by GCE: a job's runner runs once, and a VM that stopped is the sweep's.
     if spot:
-        scheduling |= {"provisioningModel": "SPOT", "instanceTerminationAction": "DELETE", "automaticRestart": False}
+        scheduling = {"onHostMaintenance": "TERMINATE", "provisioningModel": "SPOT", "instanceTerminationAction": "DELETE", "automaticRestart": False}
+    else:
+        scheduling = {"onHostMaintenance": "MIGRATE", "automaticRestart": False}
     return {
         "name": vm_name(ask.name, ask.jit),
         "machineType": f"zones/{zone}/machineTypes/{kind}",
