@@ -633,7 +633,9 @@ class GoogleCompute(Compute):
     def list(self, zone: str, label_filter: str) -> list[dict]:
         from google.cloud import compute_v1
         try:
-            instances = self._instances.list(project=self.project, zone=zone, filter=label_filter, retry=None, timeout=self.timeout_s)
+            # (The filter travels in the request: the client's list() takes no filter keyword.)
+            request = compute_v1.ListInstancesRequest(project=self.project, zone=zone, filter=label_filter)
+            instances = self._instances.list(request=request, retry=None, timeout=self.timeout_s)
             return [json.loads(compute_v1.Instance.to_json(i)) for i in instances]
         except _FAILURES as e:
             raise _refused(e) from e
