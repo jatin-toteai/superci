@@ -7,7 +7,7 @@ import time
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 
-from launcher import Compute, Config, GoogleCompute, NoRoom, launch as start_vm, stop as stop_vm, sweep as sweep_vms, verify
+from launcher import Compute, Config, GoogleCompute, NoRoom, launch as start_vm, status as vm_status, stop as stop_vm, sweep as sweep_vms, verify
 
 cfg = Config.from_env()
 api = FastAPI()
@@ -93,6 +93,22 @@ def stop(body: dict = Depends(checked), compute: Compute = Depends(get_compute))
         raise HTTPException(status_code=503, detail=str(e))
     return {"stopped": True}
 
+
+
+@api.post("/status")
+def status(body: dict = Depends(checked), compute: Compute = Depends(get_compute)):
+    """Whether this plane's VM whose instance name is `id` is still there (see `launcher.status`): `{"state": "running"}`, or
+    `{"state": "gone"}` when no zone has it or it is stopping or terminated. 400 for no `id` and for a VM of that name that is not
+    this plane's, 503 when GCE failed and the plane may ask again."""
+    name = body.get("id")
+    if not isinstance(name, str) or not name:
+        raise HTTPException(status_code=400, detail="id is missing or not text")
+    try:
+        return {"state": vm_status(name, compute, cfg)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
 @api.post("/sweep")
 def sweep(x_superci_sweep: str = Header(""), compute: Compute = Depends(get_compute)):

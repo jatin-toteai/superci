@@ -480,7 +480,8 @@ def launch(req: dict, compute: Compute, cfg: Config, now: Callable[[], float]) -
     raise NoRoom(reasons, ask.spot)
 
 
-# /stop and /sweep: delete a job's VM when the plane says its job is over, and delete the leftovers the plane never stopped.
+# /stop, /status and /sweep: delete a job's VM when the plane says its job is over, say whether it is still there, and delete
+# the leftovers the plane never stopped.
 
 def _ours(vm: dict, cfg: Config) -> bool:
     """Whether a VM carries the label `superci-plane=<cfg.plane_id>`, which is what makes it a job VM of this plane's."""
@@ -498,6 +499,19 @@ def stop(name: str, compute: Compute, cfg: Config) -> None:
         if vm is not None and _ours(vm, cfg):
             compute.delete(zone, name)
 
+
+
+def status(name: str, compute: Compute, cfg: Config) -> str:
+    """Whether this plane's VM of that name is still there, looked for in every zone of `cfg.zones` as `stop` does: "running"
+    while one of this plane's VMs of that name is in a state other than `STOPPING` or `TERMINATED` (`ENDING_STATES`), "gone"
+    otherwise, also when no zone has one. ValueError when every VM of that name is not this plane's: it is not this plane's to
+    ask after. RuntimeError when GCE fails."""
+    name = instance_name(name)
+    found = [vm for vm in (compute.get(zone, name) for zone in cfg.zones) if vm is not None]
+    ours = [vm for vm in found if _ours(vm, cfg)]
+    if found and not ours:
+        raise ValueError(f"the VM {name} is not this plane's")
+    return "running" if any(vm.get("status") not in ENDING_STATES for vm in ours) else "gone"
 
 SWEEP_GRACE_MINUTES = 10  # what a VM is given beyond its `superci-max-minutes` before it is a leftover (a late start, a slow power-off)
 

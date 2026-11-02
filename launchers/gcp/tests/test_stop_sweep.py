@@ -5,7 +5,7 @@ import time
 import pytest
 
 from fake_compute import FakeCompute, clock
-from launcher import launch, stop, sweep, vm_name
+from launcher import launch, status, stop, sweep, vm_name
 
 ZONE_A, ZONE_B, ZONE_C = "us-west4-a", "us-west4-b", "us-west4-c"
 REQ = {"name": "superci-1", "max_minutes": 60, "cpu": 2, "ram_gb": 8, "jit": "QUJD"}
@@ -84,6 +84,39 @@ def test_stop_finds_a_vm_by_the_id_launch_answered_also_in_uppercase(cfg, now):
     _, nine = made(fc, cfg, "superci-9", ZONE_A, now=now)
     stop(nine.upper(), fc, cfg)  # uppercase is the same name
     assert fc.vms == {}
+
+
+def test_status_is_running_while_this_planes_vm_is_there_wherever_it_is(cfg, now):
+    fc = FakeCompute()
+    _, in_c = made(fc, cfg, "in-c", ZONE_C, now=now)
+    assert status(in_c, fc, cfg) == "running"
+    assert status(in_c.upper(), fc, cfg) == "running"  # (an instance name, as stop makes it)
+    assert fc.deleted == []
+
+
+def test_status_is_gone_when_no_zone_has_the_vm(cfg, now):
+    fc = FakeCompute()
+    key = made(fc, cfg, "taken", ZONE_B, now=now)
+    del fc.vms[key]  # (GCE deleted it: a spot VM taken back is deleted, as its termination action says)
+    assert status(key[1], fc, cfg) == "gone"
+    assert status("never-was", fc, cfg) == "gone"
+
+
+@pytest.mark.parametrize("state", ["STOPPING", "TERMINATED"])
+def test_status_is_gone_when_the_vm_is_ending(cfg, now, state):
+    fc = FakeCompute()
+    key = made(fc, cfg, "taken", ZONE_A, now=now)
+    fc.vms[key]["status"] = state
+    assert status(key[1], fc, cfg) == "gone"
+
+
+def test_status_refuses_a_vm_of_that_name_that_is_not_this_planes_and_answers_its_own_in_another_zone(cfg, now):
+    fc = FakeCompute({(ZONE_B, "e2-standard-2"): "ok"})
+    _, theirs = made(fc, dataclasses.replace(cfg, plane_id="p2"), "theirs", ZONE_A, now=now)
+    with pytest.raises(ValueError, match="not this plane's"):
+        status(theirs, fc, cfg)
+    fc.insert(ZONE_B, {"name": theirs, "machineType": f"zones/{ZONE_B}/machineTypes/e2-standard-2", "labels": {"superci-plane": cfg.plane_id}})
+    assert status(theirs, fc, cfg) == "running"  # (its own VM of that name, in another zone, is what it answers for)
 
 
 def test_sweep_deletes_only_what_is_old_or_terminated(cfg, now):
@@ -265,6 +298,29 @@ def test_stop_route(client_with_fake, fake, cfg, mint, monkeypatch):
     monkeypatch.setattr(fake, "get", fails(RuntimeError("UNAVAILABLE: later")))
     r = post({"id": ours})
     assert (r.status_code, r.json()) == (503, {"detail": "UNAVAILABLE: later"})
+
+
+def test_status_route(client_with_fake, fake, cfg, mint, monkeypatch):
+    key = made(fake, cfg, "superci-1", now=time.time())
+    post = lambda body: client_with_fake.post("/status", json=body, headers=bearer(mint))
+    r = post({"id": key[1]})
+    assert (r.status_code, r.json()) == (200, {"state": "running"})
+    fake.vms[key]["status"] = "TERMINATED"
+    assert post({"id": key[1]}).json() == {"state": "gone"}
+    del fake.vms[key]
+    r = post({"id": key[1]})
+    assert (r.status_code, r.json()) == (200, {"state": "gone"})
+    for body in ({}, {"id": ""}, {"id": 5}, {"id": None}, {"name": key[1]}):
+        r = post(body)
+        assert r.status_code == 400 and "id" in r.json()["detail"], body
+    _, theirs = made(fake, dataclasses.replace(cfg, plane_id="p2"), "theirs", now=time.time())
+    r = post({"id": theirs})  # another plane's: refused, and not said to be gone
+    assert r.status_code == 400 and "not this plane's" in r.json()["detail"]
+    assert client_with_fake.post("/status", json={"id": key[1]}).status_code == 401
+    monkeypatch.setattr(fake, "get", fails(RuntimeError("UNAVAILABLE: later")))
+    r = post({"id": key[1]})
+    assert (r.status_code, r.json()) == (503, {"detail": "UNAVAILABLE: later"})
+    assert fake.deleted == []
 
 
 # The sweep that /stop runs first (a /launch does not, so that it keeps its time budget).
