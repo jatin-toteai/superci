@@ -130,7 +130,8 @@ def test_the_fallback_is_not_tried_when_the_budget_is_spent_by_then(cfg):
 
 
 def test_a_second_launch_with_the_same_jit_answers_the_existing_vm(cfg):
-    # (The plane asking again after a timeout sends the same request: the VM its first call made is the answer.)
+    # (An identical request, the same JIT configuration, is answered with the VM the first call made. The plane registers a new
+    # JIT configuration for each attempt, so a retry after a timeout is a different request and gets its own VM.)
     fc = FakeCompute({("us-west4-a", "e2-standard-2"): "exhausted", ("us-west4-b", "e2-standard-2"): "ok"})
     first = launch(REQ, fc, cfg, clock())
     assert len(fc.inserted) == 2
