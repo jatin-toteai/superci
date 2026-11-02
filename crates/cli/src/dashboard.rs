@@ -1067,9 +1067,7 @@ fn aws_machine(j: &serde_json::Value) -> Option<(String, String, String)> {
         Some(c) => format!("{kind} · {c} CPU{}", text.strip_prefix(&format!("{c} CPU · {kind}")).unwrap_or_default().trim_end_matches(" · on-demand")),
         None => text.trim_end_matches(" · on-demand").to_string(),
     };
-    let market = if j["on_demand"] == true {
-        match off_spot(j) { Some((why, _)) => format!("On-demand · {}", why.strip_prefix("On-demand: ").unwrap_or(&why)), None => "On-demand".to_string() }
-    } else if j["spot_again"] == true { "Spot · an on-demand machine did not fit your AWS account's on-demand limit".to_string() } else {
+    let market = if j["on_demand"] == true { on_demand_said(j) } else if j["spot_again"] == true { "Spot · an on-demand machine did not fit your AWS account's on-demand limit".to_string() } else {
         // Why this one: its price, and the cheaper choice it was not, when that had no machine; and what was not asked
         // for at all, priced over an on-demand machine.
         let asks = j["asks"].as_array().cloned().unwrap_or_default();
@@ -1092,6 +1090,24 @@ fn aws_machine(j: &serde_json::Value) -> Option<(String, String, String)> {
         (r, None) => format!("{} · {r}", region_short(r)),
     };
     Some((machine, market, place))
+}
+
+/// How an on-demand machine was bought, for a job's page: "On-demand", and why when SuperCI knows ("On-demand · run
+/// again after AWS took back its spot machine").
+fn on_demand_said(j: &serde_json::Value) -> String {
+    match off_spot(j) { Some((why, _)) => format!("On-demand · {}", why.strip_prefix("On-demand: ").unwrap_or(&why)), None => "On-demand".to_string() }
+}
+
+/// A GCP job's machine for its page, as an AWS job's: the machine ("c4d-standard-4 · 4 CPU") and how it was bought
+/// ("Spot · $0.1204 an hour", or "On-demand" and why). None: not on a GCP machine (yet).
+fn gcp_machine(j: &serde_json::Value) -> Option<(String, String)> {
+    if j["cloud"] != "gcp" || j["machine_type"].as_str().is_none_or(str::is_empty) { return None }
+    let kind = j["machine_type"].as_str().unwrap_or_default();
+    let machine = match j["cpu"].as_u64() { Some(c) => format!("{kind} · {c} CPU"), None => kind.to_string() };
+    let market = if j["on_demand"] == true { on_demand_said(j) } else {
+        match j["usd_per_hour"].as_f64().filter(|u| *u > 0.0) { Some(u) => format!("Spot · ${u:.4} an hour"), None => "Spot".to_string() }
+    };
+    Some((machine, market))
 }
 
 /// Why a job that asked for a spot machine ran on an on-demand one (which costs about twice as much): what AWS said
@@ -4479,7 +4495,7 @@ mark();load()})();</script>"#;
         } else { connect_action("aws") };
         // GCP: a launcher you run, added by its address (the control plane asks it who it is before keeping it).
         let gcp = if launcher("gcp") { added.clone() } else {
-            row_form("/runners/gcp", r#"<input type="url" name="url" placeholder="https://launcher.example" required aria-label="Launcher address" style="width:240px;max-width:100%;min-width:0;height:32px;padding:0 10px;border:1px solid var(--rule);border-radius:9px;background:var(--card);color:var(--ink);font-size:12.5px">"#, "Add")
+            row_form("/runners/gcp", r#"<input type="url" name="url" placeholder="https://launcher.example" required aria-label="Launcher address">"#, "Add")
         };
         // A Modal control plane starts sandboxes itself; one elsewhere gets a small launcher in your Modal workspace.
         let own_modal = matches!(v.plane, Plane::Modal { .. });
@@ -4783,10 +4799,12 @@ mark();load()})();</script>"#;
         let facts = [
             row("Status", format!(r#"<span class="jt-state {kind}"><i></i>{word}</span>"#)),
             row("Run", run),
-            // An AWS machine: what it is, how it was bought (spot, or on-demand and why), and where it ran.
-            match aws_machine(&j) {
-                Some((machine, market, place)) => [row("Machine", format!("{}<span>{}</span>", logo("aws", 16), esc(&machine))), row("Spot or on-demand", esc(&market)), row("Region", esc(&place))].concat(),
-                None => row("Runner", if runner.is_empty() { String::new() } else { format!("{}<span>{}</span>", logo(&runner_logo, 16), esc(&runner)) }),
+            // An AWS machine: what it is, how it was bought (spot, or on-demand and why), and where it ran; a GCP one, the
+            // same but for where (its launcher keeps one region).
+            match (aws_machine(&j), gcp_machine(&j)) {
+                (Some((machine, market, place)), _) => [row("Machine", format!("{}<span>{}</span>", logo("aws", 16), esc(&machine))), row("Spot or on-demand", esc(&market)), row("Region", esc(&place))].concat(),
+                (None, Some((machine, market))) => [row("Machine", format!("{}<span>{}</span>", logo("gcp", 16), esc(&machine))), row("Spot or on-demand", esc(&market))].concat(),
+                (None, None) => row("Runner", if runner.is_empty() { String::new() } else { format!("{}<span>{}</span>", logo(&runner_logo, 16), esc(&runner)) }),
             },
             row("Time", duration(&j)),
             row("Cost", job_cost(&j).filter(|c| *c > 0.0).map(|c| cost_text(&j, c)).unwrap_or_default()),
@@ -5618,8 +5636,8 @@ const PLANE_SOON: [(&str, &str); 9] = [
 ];
 
 /// Where runners can come from, beyond the available ones.
-const RUNNERS_SOON: [(&str, &str); 10] = [
-    ("machine", "Your own Mac or Linux machine, a clean VM per job."), ("googlecloud", "Compute Engine spot VMs, one per job."), ("azure", "Spot virtual machines, one per job."), ("hetzner", "Cloud servers by the hour, one per job."),
+const RUNNERS_SOON: [(&str, &str); 9] = [
+    ("machine", "Your own Mac or Linux machine, a clean VM per job."), ("azure", "Spot virtual machines, one per job."), ("hetzner", "Cloud servers by the hour, one per job."),
     ("digitalocean", "Droplets, one per job."), ("flydotio", "Fly Machines, one per job."), ("scaleway", "Instances, one per job."), ("vultr", "Cloud compute, one per job."),
     ("akamai", "Linode instances, one per job."), ("kubernetes", "Pods in your own cluster, one per job."),
 ];
@@ -7810,6 +7828,40 @@ mod tests {
         assert_eq!(aws_machine(&serde_json::json!({ "cloud": "cloudflare", "machine_type": "4cpu-12gb" })), None);
     }
 
+    /// A GCP job's page says its machine as an AWS job's does (the machine, spot or on-demand and why), with no region.
+    #[test]
+    fn a_gcp_jobs_machine_is_said_as_what_and_how_bought() {
+        let spot = serde_json::json!({ "job_id": 7, "run_id": 70, "repo": "acme/app", "state": "done", "at_ms": now_ms() - 60_000, "installation_id": 0, "cloud": "gcp", "machine_type": "c4d-standard-4", "cpu": 4, "usd_per_hour": 0.1204 });
+        assert_eq!(gcp_machine(&spot), Some(("c4d-standard-4 · 4 CPU".into(), "Spot · $0.1204 an hour".into())));
+        // Run again after Google took its spot machine back: on-demand, and that is why.
+        let mut again = spot.clone();
+        (again["job_id"], again["on_demand"], again["after_reclaim"]) = (9.into(), true.into(), true.into());
+        assert_eq!(gcp_machine(&again), Some(("c4d-standard-4 · 4 CPU".into(), "On-demand · run again after GCP took back its spot machine".into())));
+        // No reason known, or no price or CPUs said: what is known.
+        (again["after_reclaim"], again["cpu"]) = (false.into(), serde_json::Value::Null);
+        assert_eq!(gcp_machine(&again), Some(("c4d-standard-4".into(), "On-demand".into())));
+        assert_eq!(gcp_machine(&serde_json::json!({ "cloud": "gcp", "machine_type": "e2-standard-2", "cpu": 2 })), Some(("e2-standard-2 · 2 CPU".into(), "Spot".into())));
+        // Not on a GCP machine (yet), or not GCP's.
+        assert_eq!(gcp_machine(&serde_json::json!({ "cloud": "gcp" })), None);
+        assert_eq!(gcp_machine(&serde_json::json!({ "cloud": "gcp", "machine_type": "" })), None);
+        assert_eq!(gcp_machine(&serde_json::json!({ "cloud": "aws", "machine_type": "c8a.xlarge", "cpu": 4 })), None);
+        assert_eq!(gcp_machine(&serde_json::json!({ "cloud": "cloudflare", "machine_type": "4cpu-12gb" })), None);
+
+        // The job's page: Machine and Spot or on-demand rows, no Region, no Runner row; an AWS job's page as before.
+        let mut d = with_cloudflare(&[("a1", "Acme Inc.")]);
+        let plane = Plane::Cloudflare { account_id: "a1".into(), account_name: "Acme Inc.".into(), script: "superci".into(), url: "https://superci.acme.workers.dev".into(), plane_id: "p1".into(), label: "superci".into() };
+        let aws = serde_json::json!({ "job_id": 8, "run_id": 80, "repo": "acme/app", "state": "done", "at_ms": now_ms() - 60_000, "installation_id": 0, "cloud": "aws", "machine_type": "c8a.xlarge", "cpu": 4, "region": "us-east-2" });
+        let view = PlaneView { plane, online: true, github: true, installed: true, aws: false, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()),
+            status: Some(serde_json::json!({ "containers": true, "launchers": [{ "cloud": "gcp", "url": "https://launcher.example" }], "jobs": [spot, again, aws] })) };
+        d.job_shown = ("7".into(), String::new());
+        let page = d.render("job", &[view.clone()], None);
+        assert!(page.contains(&format!("<strong>Machine</strong></span><span class=\"limit-do\">{}<span>c4d-standard-4 · 4 CPU</span>", logo("gcp", 16))) && page.contains("<strong>Spot or on-demand</strong></span><span class=\"limit-do\">Spot · $0.1204 an hour</span>"), "{page}");
+        assert!(!page.contains("<strong>Region</strong>") && !page.contains("<strong>Runner</strong>"), "{page}");
+        d.job_shown = ("8".into(), String::new());
+        let page = d.render("job", &[view], None);
+        assert!(page.contains(&format!("{}<span>c8a.xlarge · 4 CPU</span>", logo("aws", 16))) && page.contains("<strong>Region</strong>") && !page.contains("Spot · $"), "{page}");
+    }
+
     #[test]
     fn an_organizations_picture_is_asked_for_at_the_start_and_once_a_day() {
         let mut d = Dashboard::new();
@@ -8272,10 +8324,14 @@ mod tests {
 
         // None yet: a row with a field for its address and an Add button, posting where the address is checked.
         let html = d.render("add-runners", &[view(serde_json::json!([]), serde_json::json!([{ "cloud": "cloudflare" }]))], None);
+        preview("add-runners-gcp", &html);
         let gcp = row(&html);
         let form = &gcp[gcp.find(r#"<form method="post" action="/runners/gcp">"#).unwrap_or_else(|| panic!("{gcp}"))..];
         assert!(form.contains(r#"type="url""#) && form.contains(r#"name="url""#) && form.contains(r#"placeholder="https://launcher.example""#) && form.contains(" required") && form.contains(r#"aria-label="Launcher address""#), "{gcp}");
         assert!(form.contains(r#"<button class="button primary sm">Add</button></form>"#) && !gcp.contains("Added"), "{gcp}");
+        // Styled by the page's own rules (not by hand), with Google Cloud's mark on its tile; and no "coming soon" row for it.
+        assert!(!form.contains("style=") && gcp.contains(&logo("googlecloud", 36)) && !gcp.contains(r#"class="logo" style="width:36px;height:36px;background:var(--card-2)""#), "{gcp}");
+        assert!(!html.contains("Compute Engine") && !html.contains("Google Cloud") && html.contains("Your own computer, Azure, Hetzner and 6 more, coming soon"), "the row that was coming soon is this one");
 
         // One there: no form to add another, and the Runners page shows its address with the way to remove it.
         let there = view(serde_json::json!([{ "cloud": "gcp", "url": "https://launcher.example" }]), serde_json::json!([{ "cloud": "cloudflare" }, { "cloud": "gcp" }]));
