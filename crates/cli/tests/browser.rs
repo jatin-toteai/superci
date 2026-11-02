@@ -15825,7 +15825,7 @@ mod commands_dashboard_in_browser {
         let setting = |n: &str| served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == n).map(|(_, v)| v);
         let page = || common::words(&common::part(&link, "/?p=runners&fragment=1").1);
         // Refused: a provider that is not one; a dialog shown for another control plane.
-        let (status, _, said) = common::post(&link, "/runners/remove", &[("cloud", "gcp")]);
+        let (status, _, said) = common::post(&link, "/runners/remove", &[("cloud", "hetzner")]);
         assert!(status == 400 && common::words(&said).contains("Unknown provider"), "{status}");
         let (status, _, said) = common::post(&link, "/runners/remove", &[("cloud", "aws"), ("plane", "anotherplane1")]);
         assert!(status == 409 && common::words(&said).contains("Another control plane is in use now"), "{status}");
