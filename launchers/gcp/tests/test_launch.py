@@ -10,7 +10,7 @@ from google.api_core import exceptions as google_errors
 from google.cloud import compute_v1
 
 from fake_compute import FakeCompute, clock
-from launcher import Compute, GoogleCompute, NoRoom, launch, render_startup
+from launcher import Compute, GoogleCompute, NoRoom, launch, render_shutdown, render_startup
 
 ZONES = ["us-west4-a", "us-west4-b", "us-west4-c"]
 TYPES = ["e2-standard-2", "c4d-standard-2", "n2d-standard-2"]  # what 2 vCPUs and 8 GB choose, in the order tried
@@ -33,6 +33,10 @@ def without(*keys) -> dict:
 
 def startup_script(body: dict) -> str:
     return body["metadata"]["items"][0]["value"]
+
+
+def metadata_keys(body: dict) -> list[str]:
+    return [item["key"] for item in body["metadata"]["items"]]
 
 
 def test_the_first_pair_with_room_wins_and_the_answer_prices_it(cfg):
@@ -75,6 +79,7 @@ def test_the_fallback_starts_an_on_demand_vm_of_the_first_type_in_the_first_zone
     assert last["zone"] == "us-west4-a" and last["body"]["machineType"].endswith("/e2-standard-2")
     assert "provisioningModel" not in last["body"]["scheduling"]
     assert "instance/preempted" not in startup_script(last["body"])  # an on-demand VM has no notice to give
+    assert metadata_keys(last["body"]) == ["startup-script"] and metadata_keys(fc.inserted[0]["body"]) == ["startup-script", "shutdown-script"]
     assert launch(REQ, fc, cfg, clock()) == a and len(fc.inserted) == 10  # asked again, it is the same VM, still on demand
 
 
@@ -301,7 +306,8 @@ def test_the_vm_body_of_a_spot_request(cfg):
             "diskSizeGb": 60, "diskType": "zones/us-west4-a/diskTypes/pd-balanced"}}],
         "networkInterfaces": [{"subnetwork": "projects/superci-test/regions/us-west4/subnetworks/superci-us-west4",
                                "nicType": "GVNIC", "accessConfigs": [{"type": "ONE_TO_ONE_NAT"}]}],
-        "metadata": {"items": [{"key": "startup-script", "value": render_startup("QUJD", None, 70, NOTICE, cfg.runner_version)}]},
+        "metadata": {"items": [{"key": "startup-script", "value": render_startup("QUJD", None, 70, NOTICE, cfg.runner_version)},
+                               {"key": "shutdown-script", "value": render_shutdown(NOTICE)}]},
         "serviceAccounts": [],
         "labels": {"superci-plane": "p1", "superci-job": "4711", "superci-repo": "acme-widgets-git", "superci-max-minutes": "70"},
         "scheduling": {"provisioningModel": "SPOT", "instanceTerminationAction": "DELETE", "automaticRestart": False,
@@ -318,6 +324,7 @@ def test_spot_false_makes_an_on_demand_vm_with_no_notice(cfg):
     assert body["networkInterfaces"][0]["nicType"] == "GVNIC"
     script = startup_script(body)
     assert "instance/preempted" not in script and NOTICE not in script
+    assert metadata_keys(body) == ["startup-script"]  # (no shutdown-script: there is no preemption to tell)
     assert "--jitconfig QUJD" in script and script == render_startup("QUJD", None, 70, None, cfg.runner_version)
 
 
@@ -327,6 +334,7 @@ def test_a_spot_vm_with_no_notice_to_give_has_no_watcher_and_a_failing_runner_ha
     body = fc.inserted[0]["body"]
     assert body["scheduling"]["provisioningModel"] == "SPOT"
     assert startup_script(body) == render_startup("QUJD", "d2h5", 70, None, cfg.runner_version)
+    assert metadata_keys(body) == ["startup-script"]
 
 
 def test_an_on_demand_request_gets_no_second_try_as_a_fallback(cfg):

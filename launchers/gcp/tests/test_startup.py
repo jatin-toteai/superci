@@ -5,9 +5,11 @@ import subprocess
 
 import pytest
 
-from launcher import instance_name, render_startup
+from launcher import instance_name, render_shutdown, render_startup
 
 NOTICE = "https://plane.example/interrupted?runner=x&t=tok"
+# How the notice is posted, as AWS's spot machines post theirs: each try bounded, tried again, and the plane's answer run with bash.
+POST = "curl -s -f -m 5 --retry 4 --retry-all-errors -X POST"
 
 
 def test_instance_names_are_valid_for_gce_and_stable():
@@ -33,7 +35,46 @@ def test_instance_name_edge_cases_are_still_valid():
 def test_a_spot_script_watches_for_preemption_and_a_plain_one_does_not():
     s = render_startup("QUJD", None, 70, NOTICE, "2.330.0")
     assert "shutdown -h +70" in s and "instance/preempted" in s and NOTICE in s and "--jitconfig QUJD" in s and s.rstrip().endswith("poweroff")
+    assert f"{POST} '{NOTICE}' 2>/dev/null | bash &>/dev/null" in s
     assert "instance/preempted" not in render_startup("QUJD", None, 70, None, "2.330.0")
+
+
+def test_the_shutdown_script_is_made_only_with_a_notice_and_checks_for_preemption_before_posting():
+    assert render_shutdown(None) is None
+    s = render_shutdown(NOTICE)
+    assert s.startswith("#!/bin/bash\n")
+    check = """[ "$(curl -s -m 2 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/preempted')" = TRUE ] || exit 0"""
+    post = f"{POST} '{NOTICE}' 2>/dev/null | bash &>/dev/null"
+    assert check in s and post in s and s.index(check) < s.index(post)
+    assert _bash_syntax_error(s) == ""
+    quoted = render_shutdown("https://x.example/a'; reboot; echo '")
+    assert "'https://x.example/a'\\''; reboot; echo '\\'''" in quoted and _bash_syntax_error(quoted) == ""
+
+
+SHUTDOWN_CURL = """#!/bin/bash
+case "$*" in
+  *instance/preempted*) printf %s 'PREEMPTED';;
+  *) echo "$*" >> DIR/posted; echo "echo answered >> DIR/answered";;
+esac
+"""
+
+
+@pytest.mark.parametrize("preempted", ["TRUE", "FALSE", ""])
+def test_running_the_shutdown_script_posts_the_notice_and_runs_the_answer_only_when_preempted(tmp_path, preempted):
+    # (The metadata server answers TRUE once GCE preempts the VM; FALSE, or nothing, at any other shutdown.)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    curl = bin_dir / "curl"
+    curl.write_text(SHUTDOWN_CURL.replace("PREEMPTED", preempted).replace("DIR", str(tmp_path)))
+    curl.chmod(curl.stat().st_mode | stat.S_IEXEC)
+    done = subprocess.run(["bash", "-c", render_shutdown(NOTICE)], env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+                          capture_output=True, text=True, timeout=15)
+    assert done.returncode == 0, done.stderr
+    if preempted == "TRUE":
+        assert (tmp_path / "posted").read_text().splitlines() == [f"-s -f -m 5 --retry 4 --retry-all-errors -X POST {NOTICE}"]
+        assert (tmp_path / "answered").read_text() == "answered\n"
+    else:
+        assert not (tmp_path / "posted").exists() and not (tmp_path / "answered").exists()
 
 
 def test_a_failing_runner_gets_its_hook_and_bad_base64_is_refused():
@@ -101,17 +142,18 @@ def _run(tmp_path, fail, notice, expected="2.330.0"):
 
     # The metadata server answers TRUE only once the runner has started, as in production, where the value changes at
     # preemption, while the job runs: a watcher that blocks the script before the runner starts never sees it. (Until
-    # then it answers FALSE, after three seconds of holding the request.) The plane's link is recorded when posted to.
+    # then it answers FALSE, after three seconds of holding the request.) The plane's link is recorded when posted to, and the
+    # plane's answer is a script that records that it was run.
     stub(bin_dir / "curl", f'''case "$*" in
   *instance/preempted*) for i in $(seq 30); do [ -e {tmp_path}/runner-args ] && echo TRUE && exit; sleep 0.1; done; echo FALSE;;
-  *) echo "$*" >> {tmp_path}/posted; echo posted >> {tmp_path}/events;;
+  *) echo "$*" >> {tmp_path}/posted; echo posted >> {tmp_path}/events; echo "echo answered >> {tmp_path}/events; touch {tmp_path}/answered";;
 esac
 ''')
     stub(bin_dir / "sudo", 'while [ "$1" != -H ]; do shift; done; shift; exec "$@"\n')  # sudo -u runner -H ...
     stub(bin_dir / "timeout", 'shift; exec "$@"\n')
     stub(bin_dir / "shutdown", f'echo "$*" >> {tmp_path}/shutdown\n')
     stub(bin_dir / "poweroff", f'echo poweroff >> {tmp_path}/events\n')
-    # The runner: records how it was started, then stays up (as a job does) until the link has been posted to.
+    # The runner: records how it was started, then stays up (as a job does) until the plane's answer to the post has been run.
     wait = "yes" if notice else ""
     # (`run.sh --version` as GitHub's runner prints it: the version, then two lines of its wrapper scripts.)
     stub(home / "run.sh", f'''if [ "$1" = --version ]; then echo 2.330.0; echo "Runner listener exit with 0 return code, stop the service, no retry needed."; echo "Exiting runner..."; exit; fi
@@ -119,7 +161,7 @@ echo "$*" > {tmp_path}/runner-args
 echo runner-started >> {tmp_path}/events
 echo "${{ACTIONS_RUNNER_HOOK_JOB_STARTED-unset}}" > {tmp_path}/runner-hook
 [ -z "${{ACTIONS_RUNNER_HOOK_JOB_STARTED}}" ] || "${{ACTIONS_RUNNER_HOOK_JOB_STARTED}}" > {tmp_path}/hook-said
-[ -z "{wait}" ] || for i in $(seq 50); do [ -e {tmp_path}/posted ] && break; sleep 0.1; done
+[ -z "{wait}" ] || for i in $(seq 50); do [ -e {tmp_path}/answered ] && break; sleep 0.1; done
 echo runner-ended >> {tmp_path}/events
 ''')
     script = render_startup("QUJD", fail, 70, notice, expected)
@@ -135,12 +177,13 @@ echo runner-ended >> {tmp_path}/events
     return lambda name: (tmp_path / name).read_text() if (tmp_path / name).exists() else None
 
 
-def test_running_a_spot_script_posts_the_notice_once_while_the_runner_runs(tmp_path):
+def test_running_a_spot_script_posts_the_notice_once_while_the_runner_runs_and_runs_the_answer(tmp_path):
     seen = _run(tmp_path, None, NOTICE)
     assert seen("shutdown").strip() == "-h +70"
     assert seen("runner-args").strip() == "--jitconfig QUJD" and seen("runner-hook").strip() == "unset"
-    assert seen("posted").splitlines() == [f"-s -X POST {NOTICE}"]
-    assert seen("events").splitlines() == ["runner-started", "posted", "runner-ended", "poweroff"]  # posted while the runner ran
+    assert seen("posted").splitlines() == [f"-s -f -m 5 --retry 4 --retry-all-errors -X POST {NOTICE}"]
+    # (Posted while the runner ran, and the plane's answer run with bash.)
+    assert seen("events").splitlines() == ["runner-started", "posted", "answered", "runner-ended", "poweroff"]
 
 
 def test_running_a_plain_script_posts_nothing(tmp_path):

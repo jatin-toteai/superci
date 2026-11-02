@@ -154,11 +154,24 @@ def vm_name(runner: str, jit: str) -> str:
 # What the job VM runs at boot: GitHub's runner for one job, then power off. `startup.sh.tmpl` is the script; these
 # are the two optional parts that `render_startup` puts in it.
 
+# How the control plane's notice link is posted to, as AWS's spot machines post to theirs (`SPOT_WATCH` in crates/core/src/aws.rs):
+# each try cut at 5 seconds, four more tries on any error, and the plane's answer (a script that writes the reason into the log of
+# the job's running step) run with bash.
+_POST_NOTICE = "curl -s -f -m 5 --retry 4 --retry-all-errors -X POST __NOTICE__ 2>/dev/null | bash &>/dev/null"
+
 # GCE's metadata server answers `preempted?wait_for_change=true` when the value changes, to TRUE as the VM is taken
 # back (30 seconds before it is stopped). The plane is told once, in the background, from before the runner starts.
 _NOTICE_WATCHER = """# Told to the control plane when GCE takes this VM back.
 ( until [ "$(curl -s -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/preempted?wait_for_change=true')" = TRUE ]; do sleep 1; done
-  curl -s -X POST __NOTICE__ ) &"""
+  """ + _POST_NOTICE + """ ) &"""
+
+# GCE's documented way to act on a preemption: the `shutdown-script` metadata item, which GCE runs while the VM stops, within the
+# 30 seconds a preempted spot VM is given. It runs at every other stop too (a power-off at the end of the job, a delete), when
+# `instance/preempted` is FALSE and nothing is posted. It is kept beside the watcher in the startup script.
+_SHUTDOWN_SCRIPT = """#!/bin/bash
+# Told to the control plane when this VM stops because GCE takes it back, and only then.
+[ "$(curl -s -m 2 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/preempted')" = TRUE ] || exit 0
+""" + _POST_NOTICE + "\n"
 
 # A failing runner's job-started hook says why (base64, as the control plane wrote it) and fails the job before any
 # step, as `runner_command` in the Modal launcher does. `RUNNER_ENV` is the setting the runner's command line gets (`sudo` would drop an exported one).
@@ -200,6 +213,12 @@ def render_startup(jit: str, fail: str | None, max_minutes: int, notice: str | N
         "__FAIL_HOOK__\n": hook + "\n" if hook else "",
     }
     return re.sub("|".join(map(re.escape, parts)), lambda found: parts[found.group()], template)
+
+
+def render_shutdown(notice: str | None) -> str | None:
+    """The shutdown script of a spot job VM, which posts to `notice` when the VM stops because GCE preempts it; None when there is
+    no notice to give (an on-demand VM, or a request without one)."""
+    return _SHUTDOWN_SCRIPT.replace("__NOTICE__", _quoted(notice)) if notice is not None else None
 
 
 # /launch: ask Google Compute Engine for the job's VM in each (machine type, zone) pair in turn until one has room.
@@ -322,9 +341,10 @@ def subnet_path(cfg: Config) -> str:
 MIN_DISK_GB = 10
 
 
-def _vm_body(cfg: Config, ask: _Ask, zone: str, kind: str, spot: bool, script: str) -> dict:
+def _vm_body(cfg: Config, ask: _Ask, zone: str, kind: str, spot: bool, script: str, shutdown: str | None = None) -> dict:
     """The Instance resource of a job VM of machine type `kind` in `zone`: a spot VM (deleted when GCE takes it back, never restarted)
-    or an on-demand one. No service account: a job runs as root on its VM and must not reach the project."""
+    or an on-demand one. `script` is its startup script and `shutdown` its shutdown script, when it has one (a spot VM with a
+    notice to give). No service account: a job runs as root on its VM and must not reach the project."""
     interface = {"subnetwork": subnet_path(cfg), "nicType": "GVNIC"}  # (c4d takes gVNIC only; e2 and n2d support it, and the image has the driver)
     if cfg.external_address:  # path A; path B's VMs have Cloud NAT instead
         interface["accessConfigs"] = [{"type": "ONE_TO_ONE_NAT"}]
@@ -344,7 +364,8 @@ def _vm_body(cfg: Config, ask: _Ask, zone: str, kind: str, spot: bool, script: s
             },
         }],
         "networkInterfaces": [interface],
-        "metadata": {"items": [{"key": "startup-script", "value": script}]},
+        "metadata": {"items": [{"key": "startup-script", "value": script}]
+                     + ([{"key": "shutdown-script", "value": shutdown}] if shutdown is not None else [])},
         "serviceAccounts": [],
         "labels": {"superci-plane": cfg.plane_id, "superci-job": _label(ask.job), "superci-repo": _label(ask.repo),
                    "superci-max-minutes": str(ask.max_minutes)},
@@ -412,6 +433,7 @@ def launch(req: dict, compute: Compute, cfg: Config, now: Callable[[], float]) -
     if not types:
         raise ValueError(f"no machine type has {ask.cpu} vCPUs and {ask.ram_gb} GB of memory")
     script = render_startup(ask.jit, ask.fail, ask.max_minutes, ask.notice if ask.spot else None, cfg.runner_version)
+    shutdown = render_shutdown(ask.notice if ask.spot else None)
     name = vm_name(ask.name, ask.jit)
     for zone in cfg.zones:
         vm = compute.get(zone, name)
@@ -425,7 +447,7 @@ def launch(req: dict, compute: Compute, cfg: Config, now: Callable[[], float]) -
         for zone in cfg.zones:
             if left() <= 0:
                 raise NoRoom(reasons + [(_pair(kind, zone), "no time left")], ask.spot)
-            error = _insert(compute, zone, _vm_body(cfg, ask, zone, kind, ask.spot, script), cfg, left)
+            error = _insert(compute, zone, _vm_body(cfg, ask, zone, kind, ask.spot, script, shutdown), cfg, left)
             if not error:
                 return _answer(name, kind, ask.spot)
             reasons.append((_pair(kind, zone), _no_room(error)))
