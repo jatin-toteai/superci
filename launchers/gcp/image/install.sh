@@ -47,6 +47,16 @@ mv "$daemon_json.new" "$daemon_json"
 systemctl enable docker
 systemctl restart docker
 
+# As GitHub's Ubuntu runners, and as the AWS machines' start-up script sets them at boot: unprivileged user namespaces
+# (Ubuntu 24.04 restricts them, which breaks Chromium's sandbox), and the ports a job's own servers listen on in
+# 50000-59999 never handed out to the connections the machine opens (Linux hands those out from 32768-60999).
+echo "superci: configuring sysctl"
+cat > /etc/sysctl.d/90-superci.conf <<'SYSCTL'
+kernel.apparmor_restrict_unprivileged_userns = 0
+net.ipv4.ip_local_reserved_ports = 50000-59999
+SYSCTL
+sysctl -q -p /etc/sysctl.d/90-superci.conf
+
 # The runner's user: in the docker group (which docker.io created), and with passwordless sudo as on GitHub's runners,
 # where workflows call `sudo apt-get install` and the like. The docker group is root-equivalent already, and a job VM
 # lives for one job.

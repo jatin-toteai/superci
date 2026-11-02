@@ -5,6 +5,8 @@ Ubuntu 24.04 LTS (`ubuntu-2404-lts-amd64`) with:
 
 - Docker (`docker.io` from Ubuntu), with `max-concurrent-downloads` 16 in `/etc/docker/daemon.json`
 - `git jq zip unzip xz-utils zstd build-essential pkg-config curl`
+- `/etc/sysctl.d/90-superci.conf`: `kernel.apparmor_restrict_unprivileged_userns = 0` and
+  `net.ipv4.ip_local_reserved_ports = 50000-59999`, as the AWS machines' start-up script sets them at boot
 - a `runner` user in the `docker` group, with passwordless `sudo` as on GitHub's runners
 - GitHub's runner (`actions-runner-linux-x64`) unpacked in `/home/runner`, owned by `runner`, with its dependencies
   installed (`bin/installdependencies.sh`); `RUNNER_ALLOW_RUNASROOT` is not set, so `run.sh` is started as `runner`, as
@@ -63,6 +65,10 @@ Three things must hold:
 3. The runner reports the pinned version, on the first line of its output (`run.sh` then prints two lines of its own):
    `gcloud compute ssh superci-image-check --project PROJECT --zone ZONE --command 'cd /home/runner && sudo -u runner -H ./run.sh --version'`.
    Run it as `runner`: as root, `run.sh` refuses to start.
+
+Also check that the sysctl file took effect at boot:
+`gcloud compute ssh superci-image-check --project PROJECT --zone ZONE --command 'sysctl kernel.apparmor_restrict_unprivileged_userns net.ipv4.ip_local_reserved_ports'`
+prints `0` and `50000-59999`.
 
 Then delete the VM: `gcloud compute instances delete superci-image-check --project PROJECT --zone ZONE --quiet`.
 
