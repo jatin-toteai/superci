@@ -285,6 +285,10 @@ def test_an_unexpected_error_is_raised_and_ends_the_walk(cfg):
     without("cpu"), {**REQ, "cpu": "2"}, {**REQ, "cpu": 2.5}, {**REQ, "cpu": True}, {**REQ, "cpu": 0},
     without("ram_gb"), without("max_minutes"), {**REQ, "max_minutes": 0}, {**REQ, "disk_gb": -1},
     {**REQ, "spot": "false"}, {**REQ, "fail": 5}, {**REQ, "fail": "not base64!"},
+    {**REQ, "notice": 5}, {**REQ, "notice": ""}, {**REQ, "notice": "http://plane.example/interrupted?runner=superci-1&t=tok"},
+    {**REQ, "notice": "https://"}, {**REQ, "notice": "https://plane.example/a'; reboot; echo '"},
+    {**REQ, "notice": "https://plane.example/a b"}, {**REQ, "notice": "https://plane.example/$(id)"},
+    {**REQ, "notice": "https://plane.example/a\nb"}, {**REQ, "notice": "ftp://plane.example/x"},
     {**REQ, "cpu": 65},   # no machine type has so many vCPUs
     {**REQ, "ram_gb": 257},
 ], ids=lambda r: json.dumps({k: v for k, v in r.items() if REQ.get(k) != v} or {"without": [k for k in REQ if k not in r]}))
@@ -454,6 +458,16 @@ def test_a_launch_that_finds_its_vm_stopping_is_answered_429(client_with_fake, f
     fake.vms[("us-west4-a", ID)]["status"] = "STOPPING"
     r = client_with_fake.post("/launch", json=REQ, headers=bearer(mint))
     assert (r.status_code, r.json()) == (429, {"detail": f"no spot room in us-west4 (STOPPING: VM {ID} in us-west4-a)"})
+    assert len(fake.inserted) == 1
+
+
+def test_a_notice_link_that_is_https_with_plain_characters_is_taken_and_any_other_is_400(client_with_fake, fake, mint):
+    fake.plan[("us-west4-a", "e2-standard-2")] = "ok"
+    taken = "https://plane.example:8443/interrupted?runner=superci-1&t=AbC_d-9.%2F"
+    assert client_with_fake.post("/launch", json={**REQ, "notice": taken}, headers=bearer(mint)).status_code == 200
+    assert f"'{taken}'" in startup_script(fake.inserted[0]["body"])
+    r = client_with_fake.post("/launch", json={**REQ, "name": "superci-2", "notice": "http://plane.example/interrupted"}, headers=bearer(mint))
+    assert r.status_code == 400 and "notice" in r.json()["detail"]
     assert len(fake.inserted) == 1
 
 

@@ -314,6 +314,11 @@ def _whole(req: dict, key: str, default: int | None = None) -> int:
     return value
 
 
+# A notice link the launcher puts in a VM's scripts: https, and only the characters the plane's links have (as `runner_user_data_for`
+# in crates/core/src/aws.rs requires of AWS's, with `%` for an escaped character).
+_NOTICE_LINK = re.compile(r"https://[A-Za-z0-9:/?=&._%-]+")
+
+
 def _ask(req: dict) -> _Ask:
     """The request's fields, checked: ValueError says what is wrong (the app answers 400 and the plane fails the job)."""
     if "jit" not in req:
@@ -321,8 +326,11 @@ def _ask(req: dict) -> _Ask:
     spot = req.get("spot", True)  # (the plane says nothing of it for its small failing runner)
     if not isinstance(spot, bool):
         raise ValueError("spot is not true or false")
+    notice = _text(req, "notice", required=False)
+    if notice is not None and not _NOTICE_LINK.fullmatch(notice):
+        raise ValueError("notice is not an https link of letters, digits and :/?=&._%-")
     return _Ask(name=_text(req, "name"), jit=_text(req, "jit"), fail=_text(req, "fail", required=False),
-                notice=_text(req, "notice", required=False), cpu=_whole(req, "cpu"), ram_gb=_whole(req, "ram_gb"),
+                notice=notice, cpu=_whole(req, "cpu"), ram_gb=_whole(req, "ram_gb"),
                 disk_gb=_whole(req, "disk_gb", 60), max_minutes=_whole(req, "max_minutes"), spot=spot,
                 job=str(req.get("job", "")), repo=str(req.get("repo", "")))
 
