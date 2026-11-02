@@ -113,7 +113,8 @@ esac
     stub(bin_dir / "poweroff", f'echo poweroff >> {tmp_path}/events\n')
     # The runner: records how it was started, then stays up (as a job does) until the link has been posted to.
     wait = "yes" if notice else ""
-    stub(home / "run.sh", f'''if [ "$1" = --version ]; then echo 2.330.0; exit; fi
+    # (`run.sh --version` as GitHub's runner prints it: the version, then two lines of its wrapper scripts.)
+    stub(home / "run.sh", f'''if [ "$1" = --version ]; then echo 2.330.0; echo "Runner listener exit with 0 return code, stop the service, no retry needed."; echo "Exiting runner..."; exit; fi
 echo "$*" > {tmp_path}/runner-args
 echo runner-started >> {tmp_path}/events
 echo "${{ACTIONS_RUNNER_HOOK_JOB_STARTED-unset}}" > {tmp_path}/runner-hook
