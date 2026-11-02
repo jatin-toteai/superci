@@ -177,7 +177,7 @@ def test_the_vm_body_of_a_spot_request(cfg):
             "sourceImage": "projects/superci-test/global/images/family/superci-runner",
             "diskSizeGb": 60, "diskType": "zones/us-west4-a/diskTypes/pd-balanced"}}],
         "networkInterfaces": [{"subnetwork": "projects/superci-test/regions/us-west4/subnetworks/superci-us-west4",
-                               "accessConfigs": [{"type": "ONE_TO_ONE_NAT"}]}],
+                               "nicType": "GVNIC", "accessConfigs": [{"type": "ONE_TO_ONE_NAT"}]}],
         "metadata": {"items": [{"key": "startup-script", "value": render_startup("QUJD", None, 70, NOTICE, cfg.runner_version)}]},
         "serviceAccounts": [],
         "labels": {"superci-plane": "p1", "superci-job": "4711", "superci-repo": "acme-widgets-git", "superci-max-minutes": "70"},
@@ -192,6 +192,7 @@ def test_spot_false_makes_an_on_demand_vm_with_no_notice(cfg):
     assert a == {"id": "superci-1", "kind": "e2-standard-2", "usd_per_hour": 0.0755, "spot": False}
     body = fc.inserted[0]["body"]
     assert body["scheduling"] == {"onHostMaintenance": "TERMINATE"}
+    assert body["networkInterfaces"][0]["nicType"] == "GVNIC"
     script = startup_script(body)
     assert "instance/preempted" not in script and NOTICE not in script
     assert "--jitconfig QUJD" in script and script == render_startup("QUJD", None, 70, None, cfg.runner_version)
@@ -234,6 +235,7 @@ def test_on_path_b_the_vm_has_no_external_address(cfg):
     launch(REQ, fc, dataclasses.replace(cfg, external_address=False), clock())
     nic = fc.inserted[0]["body"]["networkInterfaces"][0]
     assert "accessConfigs" not in nic and nic["subnetwork"].endswith("/subnetworks/superci-us-west4")
+    assert nic["nicType"] == "GVNIC"
 
 
 def test_the_subnet_is_used_as_a_path_when_it_is_one_and_made_into_one_when_it_is_a_name(cfg):
@@ -266,6 +268,7 @@ def test_the_vm_body_is_a_compute_instance_as_googles_client_reads_it(cfg, req, 
     assert instance.name == "superci-1" and instance.disks[0].initialize_params.disk_size_gb == 60
     assert (instance.scheduling.provisioning_model == "SPOT") == req.get("spot", True)
     assert bool(instance.network_interfaces[0].access_configs) == (not config)
+    assert instance.network_interfaces[0].nic_type == "GVNIC"
 
 
 def test_google_compute_has_the_five_methods_of_compute_and_no_more():

@@ -297,7 +297,7 @@ def subnet_path(cfg: Config) -> str:
 def _vm_body(cfg: Config, ask: _Ask, zone: str, kind: str, spot: bool, script: str) -> dict:
     """The Instance resource of a job VM of machine type `kind` in `zone`: a spot VM (deleted when GCE takes it back, never restarted)
     or an on-demand one. No service account: a job runs as root on its VM and must not reach the project."""
-    interface = {"subnetwork": subnet_path(cfg)}
+    interface = {"subnetwork": subnet_path(cfg), "nicType": "GVNIC"}  # (c4d takes gVNIC only; e2 and n2d support it, and the image has the driver)
     if cfg.external_address:  # path A; path B's VMs have Cloud NAT instead
         interface["accessConfigs"] = [{"type": "ONE_TO_ONE_NAT"}]
     scheduling = {"onHostMaintenance": "TERMINATE"}
