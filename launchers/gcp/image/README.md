@@ -51,10 +51,13 @@ no external address):
 ```
 start=$(date +%s)
 gcloud compute instances create superci-image-check --project PROJECT --zone ZONE --machine-type e2-standard-2 \
-  --image-family superci-runner --nic-type GVNIC --subnet SUBNET --no-service-account --no-scopes
+  --image-family superci-runner --network-interface=nic-type=GVNIC,subnet=SUBNET --no-service-account --no-scopes
 until gcloud compute ssh superci-image-check --project PROJECT --zone ZONE --quiet --command true; do sleep 2; done
 echo "$(( $(date +%s) - start )) seconds from create to SSH"
 ```
+
+The interface is given as `--network-interface=nic-type=GVNIC,subnet=SUBNET`, which replaces `--subnet`; the two cannot be
+combined. In a project that uses its `default` network, `--network-interface=nic-type=GVNIC` alone does the same.
 
 Three things must hold:
 
