@@ -1254,7 +1254,7 @@ impl<'a> ControlPlane<'a> {
                 }
                 // What the machine runs with this answer: the reason, in the job's own log on GitHub, where it is
                 // otherwise only "The runner has received a shutdown signal" (a GitHub job: GitLab's says its own).
-                let said = if !j.gitlab.is_empty() || q.contains_key("gl") { String::new() } else if j.provider == "local" { aws::reclaim_said(&j.cloud, "SuperCI starts the job again by itself at once, off spot machines.") } else { aws::reclaim_said(&j.cloud, "SuperCI runs the job again by itself, off spot machines, once its run has finished.") };
+                let said = if !j.gitlab.is_empty() || q.contains_key("gl") { String::new() } else if j.provider == "local" { aws::reclaim_said(&j.cloud, "SuperCI starts the job again by itself, off spot machines.") } else { aws::reclaim_said(&j.cloud, "SuperCI runs the job again by itself, off spot machines, once its run has finished.") };
                 Ok(Response::new(200, "text/x-shellscript", said))
             }
             // A machine saying how its own start went (see `MachineStart`): with its link, and only what it may say.
@@ -4851,6 +4851,24 @@ impl<'a> ControlPlane<'a> {
                 continue;
             }
             if !["launched", "running", "orphan"].contains(&j.state.as_str()) { continue; }
+            // A run from a computer's job whose launcher machine is gone (GCP deletes a spot machine it takes back, and its
+            // runner may not get to say how the job ended): its launcher is asked, once its machine has had two minutes, and
+            // only its answer "gone" ends the job, as its machine's end would (an error or any other answer: asked again at
+            // the next sweep). Its run, moved on below, then starts it again off spot machines when the machine was taken
+            // back (see `advance_run`). Not a GitHub or GitLab job's: its code host says when its runner is lost, and the
+            // job is run again from there.
+            if j.state == "running" && j.provider == "local" && now.saturating_sub(j.launched_ms.unwrap_or(j.at_ms)) > 2 * 60_000 {
+                if let (Some(id), Some(launcher)) = (&j.machine_id, self.config.launchers.iter().find(|l| l.cloud == j.cloud)) {
+                    if self.launcher_call(&plane_url, launcher, "/status", serde_json::json!({ "id": id })).await.is_ok_and(|v| v["state"] == "gone") {
+                        j.state = "failed".into();
+                        j.ended_ms = Some(now);
+                        j.error = Some(if j.interrupted { format!("{} took back its spot machine", cloud_name(&j.cloud)) } else { "its machine ended before the job did".into() });
+                        self.settle(&plane_url, &mut j).await;
+                        self.keep(&key, &j).await?;
+                        continue;
+                    }
+                }
+            }
             // A machine that never began its job (a container that did not start, a spot machine that did not boot):
             // placed again, twice at most, then the job fails with why (GitHub would otherwise keep it queued for a day).
             if j.state == "launched" && !j.seen_in_progress {
