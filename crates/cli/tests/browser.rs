@@ -12341,6 +12341,8 @@ mod gitlab_in_browser {
             let mut m = served.store.0.lock().unwrap();
             let mut j: serde_json::Value = serde_json::from_str(&m[&key]).unwrap();
             j["interrupted"] = serde_json::json!(true);
+            // (The testkit runs its jobs on its own containers, Cloudflare's: this one's machine is AWS's spot machine.)
+            j["cloud"] = serde_json::json!("aws");
             m.insert(key, j.to_string());
         }
         assert!(served.gitlab_webhook(served.gitlab.finish(e, "failed", "", now())) < 300);
@@ -13620,7 +13622,8 @@ mod runs_suite_in_browser {
         // AWS takes its spot machine back (its machine said so, with its link: here, noted on its job), and the runner
         // ends the job as failed.
         let key = served.store.under("job:").into_iter().map(|(k, _)| k).find(|k| !k.contains(':') || k.starts_with("job:")).unwrap();
-        { let mut m = served.store.0.lock().unwrap(); let mut j: serde_json::Value = serde_json::from_str(&m[&key]).unwrap(); j["interrupted"] = true.into(); m.insert(key.clone(), j.to_string()); }
+        // (The testkit runs its jobs on its own containers, Cloudflare's: this one's machine is AWS's spot machine.)
+        { let mut m = served.store.0.lock().unwrap(); let mut j: serde_json::Value = serde_json::from_str(&m[&key]).unwrap(); j["interrupted"] = true.into(); j["cloud"] = "aws".into(); m.insert(key.clone(), j.to_string()); }
         first.finish("failed");
         // Started again, on a machine of its own off spot machines: a new job of the run, and the first said so.
         let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
