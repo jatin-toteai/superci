@@ -20,10 +20,11 @@ the first zone instead.
 it and answers `{"stopped": true}`, also when it is gone already. Only a VM labelled `superci-plane=<plane id>` is deleted; one
 of that name without the label is left alone and the answer is the same.
 
-`POST /status` with `{"id": "<instance name>"}` answers `{"state": "running"}` while that VM exists and is not ending, and
-`{"state": "gone"}` when no zone has it or it is `STOPPING` or `TERMINATED`. The control plane asks it, on its sweep, for a
-job started from a computer whose machine may have gone, since no code host reports that job's end. A VM of that name that
-is not this plane's answers 400.
+`POST /status` with `{"id": "<instance name>"}` answers `{"state": "running"}` while that VM exists and is not ending,
+`{"state": "ending"}` while it is `STOPPING`, and `{"state": "gone"}` when it is `TERMINATED` or no zone has it. Only `gone`
+ends a job at the control plane: a VM taken back is `STOPPING` while its notice may still be on its way. The control plane asks
+it, on its sweep, for a job started from a computer whose machine may have gone, since no code host reports that job's end. A
+VM of that name that is not this plane's answers 400.
 
 `POST /sweep` deletes this plane's job VMs (label `superci-plane=<plane id>`) in every zone that are `TERMINATED`, or older than
 their `superci-max-minutes` label plus 10 minutes, and answers `{"swept": n}`, the number deleted. A VM that is not `TERMINATED`

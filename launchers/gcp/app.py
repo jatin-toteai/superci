@@ -97,9 +97,9 @@ def stop(body: dict = Depends(checked), compute: Compute = Depends(get_compute))
 
 @api.post("/status")
 def status(body: dict = Depends(checked), compute: Compute = Depends(get_compute)):
-    """Whether this plane's VM whose instance name is `id` is still there (see `launcher.status`): `{"state": "running"}`, or
-    `{"state": "gone"}` when no zone has it or it is stopping or terminated. 400 for no `id` and for a VM of that name that is not
-    this plane's, 503 when GCE failed and the plane may ask again."""
+    """Whether this plane's VM whose instance name is `id` is still there (see `launcher.status`): `{"state": "running"}`;
+    `{"state": "ending"}` while it is stopping; `{"state": "gone"}` when it is terminated or no zone has it. 400 for no `id` and for a
+    VM of that name that is not this plane's, 503 when GCE failed and the plane may ask again."""
     name = body.get("id")
     if not isinstance(name, str) or not name:
         raise HTTPException(status_code=400, detail="id is missing or not text")

@@ -503,15 +503,19 @@ def stop(name: str, compute: Compute, cfg: Config) -> None:
 
 def status(name: str, compute: Compute, cfg: Config) -> str:
     """Whether this plane's VM of that name is still there, looked for in every zone of `cfg.zones` as `stop` does: "running"
-    while one of this plane's VMs of that name is in a state other than `STOPPING` or `TERMINATED` (`ENDING_STATES`), "gone"
-    otherwise, also when no zone has one. ValueError when every VM of that name is not this plane's: it is not this plane's to
-    ask after. RuntimeError when GCE fails."""
+    while one of this plane's VMs of that name is in a state other than `STOPPING` or `TERMINATED` (`ENDING_STATES`); "ending"
+    while one is `STOPPING` (a VM taken back is, for up to about thirty seconds, while its notice may still be on its way to the
+    plane); "gone" when every one is `TERMINATED`, or no zone has one. ValueError when every VM of that name is not this plane's:
+    it is not this plane's to ask after. RuntimeError when GCE fails."""
     name = instance_name(name)
     found = [vm for vm in (compute.get(zone, name) for zone in cfg.zones) if vm is not None]
     ours = [vm for vm in found if _ours(vm, cfg)]
     if found and not ours:
         raise ValueError(f"the VM {name} is not this plane's")
-    return "running" if any(vm.get("status") not in ENDING_STATES for vm in ours) else "gone"
+    states = {vm.get("status") for vm in ours}
+    if states - set(ENDING_STATES):
+        return "running"
+    return "ending" if "STOPPING" in states else "gone"
 
 SWEEP_GRACE_MINUTES = 10  # what a VM is given beyond its `superci-max-minutes` before it is a leftover (a late start, a slow power-off)
 

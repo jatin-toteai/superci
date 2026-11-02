@@ -102,12 +102,23 @@ def test_status_is_gone_when_no_zone_has_the_vm(cfg, now):
     assert status("never-was", fc, cfg) == "gone"
 
 
-@pytest.mark.parametrize("state", ["STOPPING", "TERMINATED"])
-def test_status_is_gone_when_the_vm_is_ending(cfg, now, state):
+def test_status_is_gone_when_the_vm_is_terminated(cfg, now):
     fc = FakeCompute()
     key = made(fc, cfg, "taken", ZONE_A, now=now)
-    fc.vms[key]["status"] = state
+    fc.vms[key]["status"] = "TERMINATED"
     assert status(key[1], fc, cfg) == "gone"
+
+
+def test_status_is_ending_while_the_vm_is_stopping_and_running_while_another_of_its_name_runs(cfg, now):
+    # (A VM taken back is STOPPING for up to about thirty seconds, while its notice may still be on its way to the plane.)
+    fc = FakeCompute({(ZONE_B, "e2-standard-2"): "ok"})
+    key = made(fc, cfg, "taken", ZONE_A, now=now)
+    fc.vms[key]["status"] = "STOPPING"
+    assert status(key[1], fc, cfg) == "ending"
+    fc.insert(ZONE_B, {"name": key[1], "machineType": f"zones/{ZONE_B}/machineTypes/e2-standard-2", "labels": {"superci-plane": cfg.plane_id}})
+    assert status(key[1], fc, cfg) == "running"
+    fc.vms[(ZONE_B, key[1])]["status"] = "TERMINATED"
+    assert status(key[1], fc, cfg) == "ending"
 
 
 def test_status_refuses_a_vm_of_that_name_that_is_not_this_planes_and_answers_its_own_in_another_zone(cfg, now):
@@ -305,6 +316,8 @@ def test_status_route(client_with_fake, fake, cfg, mint, monkeypatch):
     post = lambda body: client_with_fake.post("/status", json=body, headers=bearer(mint))
     r = post({"id": key[1]})
     assert (r.status_code, r.json()) == (200, {"state": "running"})
+    fake.vms[key]["status"] = "STOPPING"
+    assert post({"id": key[1]}).json() == {"state": "ending"}
     fake.vms[key]["status"] = "TERMINATED"
     assert post({"id": key[1]}).json() == {"state": "gone"}
     del fake.vms[key]
