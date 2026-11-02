@@ -85,3 +85,24 @@ def app_module(env, monkeypatch):
 @pytest.fixture
 def client(app_module) -> TestClient:
     return TestClient(app_module.api)
+
+
+@pytest.fixture
+def cfg(env):
+    """The launcher's configuration as `env` gives it: three us-west4 zones, spot only, a bare subnet name, path A."""
+    from launcher import Config
+    return Config.from_env()
+
+
+@pytest.fixture
+def fake():
+    """A `FakeCompute` that has room nowhere until a test's `plan` says so."""
+    from fake_compute import FakeCompute
+    return FakeCompute()
+
+
+@pytest.fixture
+def client_with_fake(app_module, client, fake) -> TestClient:
+    """`client`, with the app's Compute replaced by `fake` (through FastAPI's dependency overrides)."""
+    app_module.api.dependency_overrides[app_module.get_compute] = lambda: fake
+    return client

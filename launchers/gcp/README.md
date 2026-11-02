@@ -6,8 +6,13 @@ It answers `GET /health` without a token. Every other route needs a token the co
 address a request happened to arrive at), and an `exp` in the future. A token that fails any of these is answered
 with 401 and `not allowed: <why>`.
 
-This directory holds the token check and `/health`. Machine choice, the startup script, `/launch`, `/stop` and
-`/sweep` are added in later changes; `/launch` answers 501 until then.
+`POST /launch` starts a job's VM. It picks the smallest standard machine type that fits (`e2`, then `c4d`, then `n2d`) and
+walks them, and in each the zones, inserting the VM until one has room, all within about eight seconds (each insert
+waits at most five). It answers `{"id", "kind", "usd_per_hour", "spot"}`; the id is the instance name, and asking
+again for the same runner name answers the VM already made. `429 {"detail"}` means no room (the plane waits and asks again),
+`503` that GCE failed another way (the plane retries), `400` that the request is refused (for instance a GitLab job, which
+has no `jit`). With `ON_DEMAND_FALLBACK=1`, when no spot room is found it starts one on-demand VM of the first machine type in
+the first zone instead. `/stop` and `/sweep` are added in a later change.
 
 ## Configuration
 
@@ -18,7 +23,7 @@ Read from the environment when the service starts; a missing required variable s
 | `PROJECT` | GCP project that holds the job VMs (required) |
 | `REGION` | region of the job VMs, for example `us-west4` (required) |
 | `ZONES` | comma-separated zones to try, in order; default `<REGION>-a,<REGION>-b,<REGION>-c` |
-| `NETWORK`, `SUBNET` | VPC network and subnet of the job VMs (required) |
+| `NETWORK`, `SUBNET` | VPC network and subnet of the job VMs (required). `SUBNET` is a bare name (the subnet of that name in `PROJECT` and `REGION`) or a path GCE takes, such as `projects/<project>/regions/<region>/subnetworks/<name>`; the VM's network is the subnet's |
 | `IMAGE_FAMILY` | image family of the runner image (required) |
 | `RUNNER_VERSION` | GitHub runner version the startup script expects (required) |
 | `ON_DEMAND_FALLBACK` | `1` starts an on-demand VM when no spot room is found; anything else is off |

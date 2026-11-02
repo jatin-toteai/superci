@@ -5,8 +5,14 @@ import base64
 import json
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
+from typing import Protocol
+
+import requests
+from google.api_core import exceptions as google_errors
 
 from prices import ON_DEMAND, SPOT
 
@@ -178,3 +184,301 @@ def render_startup(jit: str, fail: str | None, max_minutes: int, notice: str | N
         "__FAIL_HOOK__\n": hook + "\n" if hook else "",
     }
     return re.sub("|".join(map(re.escape, parts)), lambda found: parts[found.group()], template)
+
+
+# /launch: ask Google Compute Engine for the job's VM in each (machine type, zone) pair in turn until one has room.
+
+class Compute(Protocol):
+    """What the launcher asks of Google Compute Engine, in the project and region it is set up for. `GoogleCompute` is the real one;
+    the tests use a stand-in. A VM is a dict in the form of GCE's REST API (an `Instance` resource as JSON, so camelCase keys),
+    whichever way it goes."""
+
+    def insert(self, zone: str, body: dict) -> str:
+        """Starts making the VM `body` describes in `zone` and gives the name of the operation that makes it.
+        RuntimeError(message) when GCE refuses the request itself."""
+        ...
+
+    def wait(self, zone: str, operation: str, timeout_s: float) -> dict | None:
+        """The outcome of an operation, waiting up to `timeout_s` seconds for it: `None` while it is still running, `{}` when it
+        is done, `{"error": "<CODE>: <message>"}` when it failed."""
+        ...
+
+    def get(self, zone: str, name: str) -> dict | None:
+        """The VM of that name in `zone`, or None."""
+        ...
+
+    def delete(self, zone: str, name: str) -> None:
+        """Starts deleting the VM of that name in `zone`; no error when there is none."""
+        ...
+
+    def list(self, zone: str, label_filter: str) -> list[dict]:
+        """The VMs in `zone` that match a GCE filter on labels, such as `labels.superci-plane=p1`."""
+        ...
+
+
+# An operation error that says there is no room (or no quota) for the VM in that pair, here and now: the walk goes on to the next.
+# Any other error is not the pair's lack of room and ends the launch. (The longer name is first, so a reason names the zonal code.)
+NO_ROOM_CODES = ("ZONE_RESOURCE_POOL_EXHAUSTED", "QUOTA_EXCEEDED", "RESOURCE_POOL_EXHAUSTED")
+
+
+class NoRoom(Exception):
+    """No (machine type, zone) pair took the VM within the time there was: the caller is to wait and ask again.
+
+    `reasons` is, for each pair that did not, `(pair, why)`, such as `("e2-standard-2/a", "ZONE_RESOURCE_POOL_EXHAUSTED")`; `str`
+    gives them grouped by why, which keeps it short (the plane shows only the first 300 characters of what a launcher says).
+    `spot` is whether the VM asked for was a spot one.
+    """
+
+    def __init__(self, reasons: list[tuple[str, str]], spot: bool = True):
+        by_why: dict[str, list[str]] = {}
+        for pair, why in reasons:
+            by_why.setdefault(why, []).append(pair)
+        super().__init__("; ".join(f"{why}: {', '.join(pairs)}" for why, pairs in by_why.items()))
+        self.reasons, self.spot = reasons, spot
+
+
+@dataclass(frozen=True)
+class _Ask:
+    """What a /launch request says that the VM is made from."""
+    name: str
+    jit: str
+    fail: str | None
+    notice: str | None
+    cpu: int
+    ram_gb: int
+    disk_gb: int
+    max_minutes: int
+    spot: bool
+    job: str
+    repo: str
+
+
+def _text(req: dict, key: str, required: bool = True) -> str | None:
+    value = req.get(key)
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or (required and not value):
+        raise ValueError(f"{key} is missing or not text")
+    return value
+
+
+def _whole(req: dict, key: str, default: int | None = None) -> int:
+    value = req.get(key, default)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"{key} is missing or not a whole number of at least 1")
+    return value
+
+
+def _ask(req: dict) -> _Ask:
+    """The request's fields, checked: ValueError says what is wrong (the app answers 400 and the plane fails the job)."""
+    if "jit" not in req:
+        raise ValueError("a GitLab job cannot run here: the request has no jit" if "gitlab" in req else "the request has no jit")
+    spot = req.get("spot", True)  # (the plane says nothing of it for its small failing runner)
+    if not isinstance(spot, bool):
+        raise ValueError("spot is not true or false")
+    return _Ask(name=_text(req, "name"), jit=_text(req, "jit"), fail=_text(req, "fail", required=False),
+                notice=_text(req, "notice", required=False), cpu=_whole(req, "cpu"), ram_gb=_whole(req, "ram_gb"),
+                disk_gb=_whole(req, "disk_gb", 60), max_minutes=_whole(req, "max_minutes"), spot=spot,
+                job=str(req.get("job", "")), repo=str(req.get("repo", "")))
+
+
+def _label(text: str) -> str:
+    """`text` as a GCE label value: lowercase letters, digits, `_` and `-`, at most 63 characters (anything else becomes `-`)."""
+    return re.sub(r"[^a-z0-9_-]", "-", text.lower())[:63]
+
+
+def subnet_path(cfg: Config) -> str:
+    """`cfg.subnet` as GCE's API takes a subnetwork: a path or URL (`projects/<p>/regions/<r>/subnetworks/<s>`,
+    `regions/<r>/subnetworks/<s>`, or the full https URL; one in another project is a shared VPC's) is used as it is, and a bare name
+    is the subnet of that name in this project and region. The VM's network is the subnet's, so `cfg.network` is not sent."""
+    return cfg.subnet if "/" in cfg.subnet else f"projects/{cfg.project}/regions/{cfg.region}/subnetworks/{cfg.subnet}"
+
+
+def _vm_body(cfg: Config, ask: _Ask, zone: str, kind: str, spot: bool, script: str) -> dict:
+    """The Instance resource of a job VM of machine type `kind` in `zone`: a spot VM (deleted when GCE takes it back, never restarted)
+    or an on-demand one. No service account: a job runs as root on its VM and must not reach the project."""
+    interface = {"subnetwork": subnet_path(cfg)}
+    if cfg.external_address:  # path A; path B's VMs have Cloud NAT instead
+        interface["accessConfigs"] = [{"type": "ONE_TO_ONE_NAT"}]
+    scheduling = {"onHostMaintenance": "TERMINATE"}
+    if spot:
+        scheduling |= {"provisioningModel": "SPOT", "instanceTerminationAction": "DELETE", "automaticRestart": False}
+    return {
+        "name": instance_name(ask.name),
+        "machineType": f"zones/{zone}/machineTypes/{kind}",
+        "disks": [{
+            "boot": True, "autoDelete": True, "type": "PERSISTENT",  # (autoDelete: a deleted VM leaves no disk behind)
+            "initializeParams": {
+                "sourceImage": f"projects/{cfg.project}/global/images/family/{cfg.image_family}",
+                "diskSizeGb": ask.disk_gb,
+                # c4d takes Hyperdisk only
+                "diskType": f"zones/{zone}/diskTypes/{'hyperdisk-balanced' if kind.startswith('c4d-') else 'pd-balanced'}",
+            },
+        }],
+        "networkInterfaces": [interface],
+        "metadata": {"items": [{"key": "startup-script", "value": script}]},
+        "serviceAccounts": [],
+        "labels": {"superci-plane": cfg.plane_id, "superci-job": _label(ask.job), "superci-repo": _label(ask.repo),
+                   "superci-max-minutes": str(ask.max_minutes)},
+        "scheduling": scheduling,
+    }
+
+
+def _answer(name: str, kind: str, spot: bool) -> dict:
+    return {"id": name, "kind": kind, "usd_per_hour": price(kind, spot), "spot": spot}
+
+
+def _insert(compute: Compute, zone: str, body: dict, cfg: Config, left: Callable[[], float]) -> str:
+    """Inserts the VM and waits for its operation as long as `cfg.insert_wait_s` and what is `left` of the budget allow.
+    The error the operation failed with, or "" when the VM is made or its operation is still running (then it is taken as started:
+    a VM that never comes up is found by the plane's sweep)."""
+    operation = compute.insert(zone, body)
+    wait_s = min(cfg.insert_wait_s, left())
+    outcome = compute.wait(zone, operation, wait_s) if wait_s > 0 else None
+    return (outcome or {}).get("error", "")
+
+
+def _no_room(error: str) -> str:
+    """The code in an operation error that says there is no room or no quota; RuntimeError, with the error, for any other."""
+    for code in NO_ROOM_CODES:
+        if code in error:
+            return code
+    raise RuntimeError(error)
+
+
+def _pair(kind: str, zone: str, on_demand: bool = False) -> str:
+    return f"{'on demand ' if on_demand else ''}{kind}/{zone.rsplit('-', 1)[-1]}"  # "e2-standard-2/a"
+
+
+def launch(req: dict, compute: Compute, cfg: Config, now: Callable[[], float]) -> dict:
+    """Starts the VM for a job and answers `{"id", "kind", "usd_per_hour", "spot"}`; the id is its instance name.
+
+    The walk: for each machine type that fits (`choose`, cheapest family first) and in it each zone of `cfg.zones`, insert the VM
+    and wait for the operation; no room or no quota there goes on to the next pair, anything else is RuntimeError. All within
+    `cfg.budget_s` seconds as `now` counts them (a wait is cut to what is left); the budget spent before an insert is NoRoom. An
+    insert whose operation is still running when its wait ends is answered as started. When every pair is out of room, a request
+    for a spot VM with `cfg.on_demand_fallback` on gets one on-demand VM of the first type in the first zone (answered
+    `"spot": False`, at the on-demand price, and without the preemption notice, which an on-demand VM has none to give; its
+    own no-room or error is as any other's). Otherwise NoRoom.
+
+    A VM of the instance name in any zone is answered as it is, without an insert: the plane asking again after a timeout
+    finds the VM its first call made. ValueError for a request that cannot be served.
+    """
+    began = now()
+
+    def left() -> float:
+        return cfg.budget_s - (now() - began)
+
+    ask = _ask(req)
+    types = choose(ask.cpu, ask.ram_gb)
+    if not types:
+        raise ValueError(f"no machine type has {ask.cpu} vCPUs and {ask.ram_gb} GB of memory")
+    script = render_startup(ask.jit, ask.fail, ask.max_minutes, ask.notice if ask.spot else None, cfg.runner_version)
+    name = instance_name(ask.name)
+    for zone in cfg.zones:
+        vm = compute.get(zone, name)
+        if vm is not None:
+            kind = vm["machineType"].rsplit("/", 1)[-1]
+            return _answer(name, kind, vm.get("scheduling", {}).get("provisioningModel") == "SPOT")
+    reasons: list[tuple[str, str]] = []
+    for kind in types:
+        for zone in cfg.zones:
+            if left() <= 0:
+                raise NoRoom(reasons + [(_pair(kind, zone), "no time left")], ask.spot)
+            error = _insert(compute, zone, _vm_body(cfg, ask, zone, kind, ask.spot, script), cfg, left)
+            if not error:
+                return _answer(name, kind, ask.spot)
+            reasons.append((_pair(kind, zone), _no_room(error)))
+    if cfg.on_demand_fallback and ask.spot:
+        kind, zone = types[0], cfg.zones[0]
+        if left() <= 0:
+            raise NoRoom(reasons + [(_pair(kind, zone, True), "no time left")], ask.spot)
+        plain = render_startup(ask.jit, ask.fail, ask.max_minutes, None, cfg.runner_version)
+        error = _insert(compute, zone, _vm_body(cfg, ask, zone, kind, False, plain), cfg, left)
+        if not error:
+            return _answer(name, kind, False)
+        reasons.append((_pair(kind, zone, True), _no_room(error)))
+    raise NoRoom(reasons, ask.spot)
+
+
+_FAILURES = (google_errors.GoogleAPICallError, requests.exceptions.RequestException)
+
+
+def _refused(error: Exception) -> RuntimeError:
+    """What GCE's answer, or the lack of one, is to the launcher: a failure of this call, said in the error's own words."""
+    return RuntimeError(f"{type(error).__name__}: {getattr(error, 'message', None) or error}")
+
+
+class GoogleCompute(Compute):
+    """`Compute` over Google's client library, with the credentials its environment has (on the launcher's VM, that VM's service
+    account). Not covered by the tests, which use a stand-in; the first real launch is its test.
+
+    The clients are made when first used, since making one looks for credentials and an import has none to find. An answer of
+    GCE's that is an error, or a request that timed out, is RuntimeError(message), which the app answers 503 for; each call is
+    cut at `cfg.insert_wait_s` seconds and not retried, so that a stalled API cannot hold a launch past its budget.
+    """
+
+    def __init__(self, cfg: Config):
+        self.project = cfg.project
+        self.timeout_s = cfg.insert_wait_s
+
+    @cached_property
+    def _instances(self):
+        from google.cloud import compute_v1  # (imported here: it takes most of a second)
+        return compute_v1.InstancesClient()
+
+    @cached_property
+    def _operations(self):
+        from google.cloud import compute_v1
+        return compute_v1.ZoneOperationsClient()
+
+    def insert(self, zone: str, body: dict) -> str:
+        from google.cloud import compute_v1
+        instance = compute_v1.Instance.from_json(json.dumps(body))  # (camelCase, as the REST API has it)
+        try:
+            operation = self._instances.insert(project=self.project, zone=zone, instance_resource=instance, retry=None, timeout=self.timeout_s)
+        except _FAILURES as e:
+            raise _refused(e) from e
+        return operation.name
+
+    def wait(self, zone: str, operation: str, timeout_s: float) -> dict | None:
+        from google.cloud import compute_v1
+        try:
+            done = self._operations.wait(project=self.project, zone=zone, operation=operation, timeout=timeout_s)
+        # (What the REST transport raises when the time is up is not shown by its code: a requests timeout, or GCE's own 504.)
+        except (requests.exceptions.Timeout, google_errors.DeadlineExceeded, google_errors.GatewayTimeout):
+            return None
+        except _FAILURES as e:
+            raise _refused(e) from e
+        if done.status != compute_v1.Operation.Status.DONE:
+            return None  # (GCE's own wait ends after about two minutes, done or not)
+        if done.error.errors:
+            return {"error": "; ".join(f"{e.code}: {e.message}" for e in done.error.errors)}
+        return {}
+
+    def get(self, zone: str, name: str) -> dict | None:
+        from google.cloud import compute_v1
+        try:
+            instance = self._instances.get(project=self.project, zone=zone, instance=name, retry=None, timeout=self.timeout_s)
+        except google_errors.NotFound:
+            return None
+        except _FAILURES as e:
+            raise _refused(e) from e
+        return json.loads(compute_v1.Instance.to_json(instance))
+
+    def delete(self, zone: str, name: str) -> None:
+        try:
+            self._instances.delete(project=self.project, zone=zone, instance=name, retry=None, timeout=self.timeout_s)
+        except google_errors.NotFound:
+            return
+        except _FAILURES as e:
+            raise _refused(e) from e
+
+    def list(self, zone: str, label_filter: str) -> list[dict]:
+        from google.cloud import compute_v1
+        try:
+            instances = self._instances.list(project=self.project, zone=zone, filter=label_filter, retry=None, timeout=self.timeout_s)
+            return [json.loads(compute_v1.Instance.to_json(i)) for i in instances]
+        except _FAILURES as e:
+            raise _refused(e) from e
+

@@ -4,10 +4,16 @@ import time
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 
-from launcher import Config, verify
+from launcher import Compute, Config, GoogleCompute, NoRoom, launch as start_vm, verify
 
 cfg = Config.from_env()
 api = FastAPI()
+gce = GoogleCompute(cfg)  # made once, here; it makes its Google clients (which look for credentials) when first used
+
+
+def get_compute() -> Compute:
+    """The Compute that routes use. A test replaces it: `api.dependency_overrides[get_compute] = lambda: fake`."""
+    return gce
 
 
 async def checked(request: Request) -> dict:
@@ -35,5 +41,15 @@ async def health():
 
 
 @api.post("/launch")
-async def launch(body: dict = Depends(checked)):
-    raise HTTPException(status_code=501, detail="launch is not built yet")  # replaced when machine choice and the VM body exist
+def launch(body: dict = Depends(checked), compute: Compute = Depends(get_compute)):
+    """Starts a job's VM (see `launcher.launch`). 429 means no room now and the plane is to wait, 503 that it failed and may be
+    tried again, 400 that the request is refused. A plain `def`: Google's client blocks, so the route runs in a thread, not in the
+    event loop that answers /health."""
+    try:
+        return start_vm(body, compute, cfg, time.monotonic)
+    except NoRoom as e:
+        raise HTTPException(status_code=429, detail=f"no {'spot ' if e.spot else ''}room in {cfg.region} ({e})")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
