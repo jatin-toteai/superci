@@ -10,8 +10,9 @@
 #
 # What it does: installs python3, python3-venv, rsync and Caddy (from Caddy's own apt repository); makes the user
 # superci-launcher; copies this directory to /opt/superci-launcher without .venv, tests and caches; makes or refreshes the
-# venv there from requirements.txt; installs the systemd unit and /etc/caddy/Caddyfile; enables and restarts both services;
-# and checks that http://127.0.0.1:8080/health answers {"agent":"gcp"}.
+# venv there from requirements.txt; installs the systemd unit, the sweep service and timer, and /etc/caddy/Caddyfile; enables
+# and restarts the launcher and Caddy; checks that http://127.0.0.1:8080/health answers {"agent":"gcp"}; and then starts the
+# timer that calls POST /sweep every ten minutes.
 #
 # The launcher's configuration is /etc/superci-launcher.env. The first run writes it from env.example (root-owned, mode 0600)
 # and stops, because the launcher cannot start until its placeholders are filled in; fill them in and run again. An existing
@@ -27,6 +28,8 @@ app=/opt/superci-launcher
 env_file=/etc/superci-launcher.env
 service_user=superci-launcher
 unit=superci-launcher.service
+sweep_service=superci-launcher-sweep.service
+sweep_timer=superci-launcher-sweep.timer
 caddy_keyring=/usr/share/keyrings/caddy-stable-archive-keyring.gpg
 caddy_list=/etc/apt/sources.list.d/caddy-stable.list
 health_url=http://127.0.0.1:8080/health
@@ -54,7 +57,8 @@ name=${1:-${LAUNCHER_NAME:-}}
 
 deploy=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 src=$(dirname "$deploy")
-for f in app.py launcher.py requirements.txt deploy/superci-launcher.service deploy/Caddyfile deploy/env.example; do
+for f in app.py launcher.py requirements.txt deploy/superci-launcher.service deploy/superci-launcher-sweep.service \
+  deploy/superci-launcher-sweep.timer deploy/Caddyfile deploy/env.example; do
   [ -f "$src/$f" ] || die "$src/$f not found: run this from a copy of launchers/gcp"
 done
 
@@ -94,8 +98,10 @@ echo "superci: installing the Python dependencies"
 [ -x "$app/.venv/bin/python" ] || python3 -m venv "$app/.venv"
 "$app/.venv/bin/pip" install --disable-pip-version-check --no-cache-dir -q -r "$app/requirements.txt"
 
-echo "superci: installing the systemd unit and the Caddyfile for $name"
-install -m 0644 "$deploy/superci-launcher.service" "/etc/systemd/system/$unit"
+echo "superci: installing the systemd units and the Caddyfile for $name"
+for f in "$unit" "$sweep_service" "$sweep_timer"; do
+  install -m 0644 "$deploy/$f" "/etc/systemd/system/$f"
+done
 sed "s/__NAME__/$name/g" "$deploy/Caddyfile" > "$work/Caddyfile"
 # (validated with its data and config directories under $work, so that this run leaves nothing in root's home)
 XDG_DATA_HOME=$work/data XDG_CONFIG_HOME=$work/config caddy validate --config "$work/Caddyfile" --adapter caddyfile
@@ -115,7 +121,7 @@ fi
 
 echo "superci: starting the launcher and Caddy"
 systemctl daemon-reload
-systemctl enable "$unit" caddy.service
+systemctl enable "$unit" "$sweep_timer" caddy.service
 systemctl restart "$unit"
 systemctl restart caddy.service
 
@@ -130,4 +136,7 @@ if [ "$got" != "$health_answer" ]; then
   die "$health_url did not answer $health_answer (answered: ${got:-nothing}); the log above is the service's. A KeyError there means $env_file lacks that variable"
 fi
 
-echo "superci: the launcher answers on $health_url; check https://$name/health from another machine"
+# The timer starts after the health check, so that its first sweep does not meet a launcher that is still starting.
+systemctl restart "$sweep_timer"
+
+echo "superci: the launcher answers on $health_url; sweeps run every ten minutes; check https://$name/health from another machine"
