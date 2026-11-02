@@ -7,6 +7,8 @@
 #
 # RUNNER_VERSION is the GitHub runner release to install, without the `v`. Environment: SUBNET, a subnet of ZONE's region
 # (a name, or a path GCE takes), for a project that has no `default` network; the VM needs a route to the internet.
+# NO_ADDRESS=1 gives the VM no external address, for a project whose policy refuses them: the subnet's region then
+# needs Cloud NAT for that route.
 set -euo pipefail
 
 # The current release of github.com/actions/runner on 2 November 2026 (v2.338.2, published 26 October).
@@ -39,6 +41,9 @@ image=superci-runner-$stamp
 subnet_args=()
 if [ -n "${SUBNET:-}" ]; then
   subnet_args=(--subnet "$SUBNET")
+fi
+if [ "${NO_ADDRESS:-}" = 1 ]; then
+  subnet_args+=(--no-address)
 fi
 
 # Deletes the build VM and, with it, its disk, whatever the outcome. A failed delete is said, and fails the script.
