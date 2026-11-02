@@ -2482,6 +2482,7 @@ impl<'a> ControlPlane<'a> {
                 continue
             };
             if gitlab && cloud == "modal" { never.push("Modal runs no Docker (GitLab jobs run in Docker)".into()); continue }
+            if gitlab && cloud == "gcp" { never.push("GCP's launcher runs no GitLab jobs".into()); continue }
             if gitlab && spec.os() == "windows" { never.push(format!("{name} runs no GitLab jobs on Windows")); continue }
             let size = match capacity.fit(spec) { Ok(size) => size, Err(why) => { never.push(format!("{name} runs {why}")); continue } };
             // Its label asks for an on-demand machine: not AWS's spot ones.
