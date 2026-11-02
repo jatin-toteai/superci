@@ -43,15 +43,18 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
-        """The launcher's configuration from its environment; a missing required variable raises KeyError."""
+        """The launcher's configuration from its environment; a missing required variable raises KeyError, and a ZONES that
+        names no zone (such as ",") ValueError: a launcher with no zone to try would answer every launch with no room."""
         env = os.environ
         region = env["REGION"]
-        zones = env.get("ZONES") or ",".join(f"{region}-{z}" for z in "abc")
+        zones = tuple(z.strip() for z in (env.get("ZONES") or ",".join(f"{region}-{z}" for z in "abc")).split(",") if z.strip())
+        if not zones:
+            raise ValueError(f"ZONES names no zone: {env.get('ZONES')!r}")
         subject = env["TRUSTED_SUBJECT"]
         return cls(
             project=env["PROJECT"],
             region=region,
-            zones=tuple(z.strip() for z in zones.split(",") if z.strip()),
+            zones=zones,
             network=env["NETWORK"],
             subnet=env["SUBNET"],
             image_family=env["IMAGE_FAMILY"],

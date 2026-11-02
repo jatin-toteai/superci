@@ -136,6 +136,13 @@ def test_zones_follow_the_region_unless_given(env, monkeypatch):
     assert Config.from_env().zones == ("us-east1-a", "us-east1-b", "us-east1-c")
 
 
+def test_zones_that_name_no_zone_stop_the_start(env, monkeypatch):
+    for zones in (",", " , ", " ,, "):
+        monkeypatch.setenv("ZONES", zones)
+        with pytest.raises(ValueError, match="ZONES names no zone"):
+            Config.from_env()
+
+
 def test_a_missing_setting_stops_the_start(env, monkeypatch):
     monkeypatch.delenv("PUBLIC_URL")
     with pytest.raises(KeyError, match="PUBLIC_URL"):

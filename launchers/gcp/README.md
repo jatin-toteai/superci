@@ -36,7 +36,7 @@ Read from the environment when the service starts; a missing required variable s
 |---|---|
 | `PROJECT` | GCP project that holds the job VMs (required) |
 | `REGION` | region of the job VMs, for example `us-west4` (required) |
-| `ZONES` | comma-separated zones to try, in order; default `<REGION>-a,<REGION>-b,<REGION>-c` |
+| `ZONES` | comma-separated zones to try, in order; default `<REGION>-a,<REGION>-b,<REGION>-c`. A value that names no zone, such as `,`, stops the start |
 | `NETWORK`, `SUBNET` | VPC network and subnet of the job VMs (required). `SUBNET` is a bare name (the subnet of that name in `PROJECT` and `REGION`) or a path GCE takes, such as `projects/<project>/regions/<region>/subnetworks/<name>`; the VM's network is the subnet's |
 | `IMAGE_FAMILY` | image family of the runner image (required) |
 | `RUNNER_VERSION` | GitHub runner version the startup script expects (required) |
