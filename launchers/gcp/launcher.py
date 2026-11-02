@@ -2,6 +2,7 @@
 # It trusts only tokens that control plane signed (ES256, its public keys given in TRUSTED_KEYS), made for this
 # launcher's own URL and for the plane's subject, the way the Modal and Cloudflare launchers do.
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -137,6 +138,17 @@ def instance_name(runner: str) -> str:
     if not name[:1].isalpha():
         name = "r-" + name
     return name[:63].rstrip("-")
+
+
+def vm_name(runner: str, jit: str) -> str:
+    """The instance name of the VM for a runner and its JIT configuration: `instance_name(runner)` cut to 54 characters, `-`, and
+    the first 8 hex digits of the configuration's SHA-256 (63 characters at most). It is the `id` /launch answers.
+
+    The plane never sends one configuration for two machines: after a failed start it withdraws the runner at GitHub and registers
+    a new configuration under the same runner name, and a machine that is late to come online is stopped and launched again in the
+    same way. Keyed on the configuration, a VM found by this name was made for this request (the plane asking again after a
+    timeout), never for a configuration GitHub has withdrawn."""
+    return instance_name(runner)[:54] + "-" + hashlib.sha256(jit.encode()).hexdigest()[:8]
 
 
 # What the job VM runs at boot: GitHub's runner for one job, then power off. `startup.sh.tmpl` is the script; these
@@ -308,7 +320,7 @@ def _vm_body(cfg: Config, ask: _Ask, zone: str, kind: str, spot: bool, script: s
     if spot:
         scheduling |= {"provisioningModel": "SPOT", "instanceTerminationAction": "DELETE", "automaticRestart": False}
     return {
-        "name": instance_name(ask.name),
+        "name": vm_name(ask.name, ask.jit),
         "machineType": f"zones/{zone}/machineTypes/{kind}",
         "disks": [{
             "boot": True, "autoDelete": True, "type": "PERSISTENT",  # (autoDelete: a deleted VM leaves no disk behind)
@@ -354,6 +366,11 @@ def _pair(kind: str, zone: str, on_demand: bool = False) -> str:
     return f"{'on demand ' if on_demand else ''}{kind}/{zone.rsplit('-', 1)[-1]}"  # "e2-standard-2/a"
 
 
+# The states of a VM that is being deleted or has powered off. Such a VM found by the name of a launch is not answered: no runner
+# will start on it, and the name cannot be inserted again until it is gone.
+ENDING_STATES = ("STOPPING", "TERMINATED")
+
+
 def launch(req: dict, compute: Compute, cfg: Config, now: Callable[[], float]) -> dict:
     """Starts the VM for a job and answers `{"id", "kind", "usd_per_hour", "spot"}`; the id is its instance name.
 
@@ -365,8 +382,10 @@ def launch(req: dict, compute: Compute, cfg: Config, now: Callable[[], float]) -
     `"spot": False`, at the on-demand price, and without the preemption notice, which an on-demand VM has none to give; its
     own no-room or error is as any other's). Otherwise NoRoom.
 
-    A VM of the instance name in any zone is answered as it is, without an insert: the plane asking again after a timeout
-    finds the VM its first call made. ValueError for a request that cannot be served.
+    The VM's name is `vm_name(name, jit)`. A VM of that name in any zone is answered as it is, without an insert: the plane asking
+    again after a timeout finds the VM its first call made. One found `STOPPING` or `TERMINATED` (`ENDING_STATES`) is NoRoom, so
+    that the plane waits and asks again, by when it is gone (a `TERMINATED` one is deleted by the sweep). ValueError for a request
+    that cannot be served.
     """
     began = now()
 
@@ -378,10 +397,12 @@ def launch(req: dict, compute: Compute, cfg: Config, now: Callable[[], float]) -
     if not types:
         raise ValueError(f"no machine type has {ask.cpu} vCPUs and {ask.ram_gb} GB of memory")
     script = render_startup(ask.jit, ask.fail, ask.max_minutes, ask.notice if ask.spot else None, cfg.runner_version)
-    name = instance_name(ask.name)
+    name = vm_name(ask.name, ask.jit)
     for zone in cfg.zones:
         vm = compute.get(zone, name)
         if vm is not None:
+            if vm.get("status") in ENDING_STATES:
+                raise NoRoom([(f"VM {name} in {zone}", vm["status"])], ask.spot)
             kind = vm["machineType"].rsplit("/", 1)[-1]
             return _answer(name, kind, vm.get("scheduling", {}).get("provisioningModel") == "SPOT")
     reasons: list[tuple[str, str]] = []
@@ -413,7 +434,7 @@ def _ours(vm: dict, cfg: Config) -> bool:
 
 
 def stop(name: str, compute: Compute, cfg: Config) -> None:
-    """Deletes this plane's VM of that name in every zone of `cfg.zones` that has one; overlapping launches for one runner name can
+    """Deletes this plane's VM of that name in every zone of `cfg.zones` that has one; overlapping launches of one request can
     have made two. The name is made an instance name (`instance_name`, which the `id` that /launch answered already is) before it is
     looked for, and a VM of that name without this plane's label (another plane's, or none of ours) is left alone. No VM is no error:
     it is gone already, never was, or is not this plane's. RuntimeError when GCE fails."""

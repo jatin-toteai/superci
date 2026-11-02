@@ -26,7 +26,7 @@
 ## Review Focus
 
 - A runner name that is not a valid GCE instance name (uppercase, over 63 characters, a leading digit): the launcher must sanitise it to one GCE accepts and still find the VM again by the id it returns. Test in Task 9.
-- The plane retrying `/launch` after a timeout while the first insert succeeded: a second launch for the same name must answer the existing VM's id, not fail with "already exists" and leave a VM behind. Test in Task 10.
+- The plane retrying `/launch` after a timeout while the first insert succeeded: a second launch with the same JIT configuration must answer the existing VM's id, not fail with "already exists" and leave a VM behind. The plane never sends one JIT configuration twice for different machines: after a failed start it withdraws the runner at GitHub and registers a new configuration under the same runner name, and a late machine is stopped and launched again in the same way. So the VM's name is keyed on the configuration, `instance_name(name)[:54] + "-" + sha256(jit)[:8]` (hex), and is the `id`: a launch with a new configuration under the same runner name makes a new VM, and a VM found by that name in `STOPPING` or `TERMINATED` status is answered `429`, so the plane waits and asks again. Test in Task 10.
 - A `/stop` for a VM already gone (preempted and deleted, or swept): must answer `{"stopped": true}`, not 404, or the plane's sweep retries forever. Test in Task 11.
 - A token whose `aud` is the VM's address rather than the registered URL, or vice versa: must be refused, and the registered URL must be what the plane signs for. Test in Task 7.
 - A preemption notice with a token that is not the job's, or for a job that has no notice (an on-demand machine): the plane must ignore it. Test in Task 3.
@@ -520,7 +520,7 @@ git add launchers/gcp && git commit -m "Render a job VM's startup script and a G
 
 **Interfaces:**
 - Produces: `class Compute(Protocol)` with `insert(zone: str, body: dict) -> str` (operation name), `wait(zone: str, operation: str, timeout_s: float) -> dict | None` (`None` while still running; `{}` when done; `{"error": "<CODE>: <message>"}` when failed), `get(zone: str, name: str) -> dict | None`, `delete(zone: str, name: str) -> None` (no error when absent), `list(zone: str, label_filter: str) -> list[dict]`; `class GoogleCompute(Compute)` over `google.cloud.compute_v1` (not unit-tested); `class NoRoom(Exception)` carrying the per-pair reasons; `launch(req: dict, compute: Compute, cfg: Config, now: Callable[[], float]) -> dict` returning `{"id", "kind", "usd_per_hour", "spot"}`.
-- Behaviour: `name = instance_name(req["name"])`; if `compute.get(zone, name)` finds it in any zone, answer that VM (idempotent); `spot = req.get("spot", True)`; for each type in `choose(req["cpu"], req["ram_gb"])` and each zone, in that nesting order, `insert` with the VM body from Global Constraints (SPOT fields only when `spot`; `disks[0]` of `req.get("disk_gb", 60)` GB, `pd-balanced`, or `hyperdisk-balanced` for `c4d`; `networkInterfaces[0]` on `cfg.subnet` with `accessConfigs: [{"type": "ONE_TO_ONE_NAT"}]` on path A and none on path B; `metadata.items` with `startup-script` from `render_startup`; `serviceAccounts: []`; the four labels; `scheduling.onHostMaintenance: TERMINATE`), then `wait` with `min(cfg.insert_wait_s, budget_left)`: `None` means answer started; `{}` means started; an error containing `ZONE_RESOURCE_POOL_EXHAUSTED`, `QUOTA_EXCEEDED` or `RESOURCE_POOL_EXHAUSTED` moves on; any other error raises `RuntimeError(message)` (the app answers 503). When the budget is spent before an insert is issued, raise `NoRoom`. When every pair moved on: with `cfg.on_demand_fallback`, one more insert of the first type in the first zone without the SPOT fields and answer `spot: False` at the on-demand price; else raise `NoRoom`. The app maps `NoRoom` to 429 `{"detail": "no spot room in us-west4 (<reasons>)"}`, `ValueError` to 400, `RuntimeError` to 503.
+- Behaviour: `name = vm_name(req["name"], req["jit"])`, which is `instance_name(req["name"])[:54] + "-" + sha256(jit)[:8]` (hex); if `compute.get(zone, name)` finds it in any zone, answer that VM (idempotent), except one in `STOPPING` or `TERMINATED` status, which raises `NoRoom`; `spot = req.get("spot", True)`; for each type in `choose(req["cpu"], req["ram_gb"])` and each zone, in that nesting order, `insert` with the VM body from Global Constraints (SPOT fields only when `spot`; `disks[0]` of `req.get("disk_gb", 60)` GB, `pd-balanced`, or `hyperdisk-balanced` for `c4d`; `networkInterfaces[0]` on `cfg.subnet` with `accessConfigs: [{"type": "ONE_TO_ONE_NAT"}]` on path A and none on path B; `metadata.items` with `startup-script` from `render_startup`; `serviceAccounts: []`; the four labels; `scheduling.onHostMaintenance: TERMINATE`), then `wait` with `min(cfg.insert_wait_s, budget_left)`: `None` means answer started; `{}` means started; an error containing `ZONE_RESOURCE_POOL_EXHAUSTED`, `QUOTA_EXCEEDED` or `RESOURCE_POOL_EXHAUSTED` moves on; any other error raises `RuntimeError(message)` (the app answers 503). When the budget is spent before an insert is issued, raise `NoRoom`. When every pair moved on: with `cfg.on_demand_fallback`, one more insert of the first type in the first zone without the SPOT fields and answer `spot: False` at the on-demand price; else raise `NoRoom`. The app maps `NoRoom` to 429 `{"detail": "no spot room in us-west4 (<reasons>)"}`, `ValueError` to 400, `RuntimeError` to 503.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -529,7 +529,7 @@ git add launchers/gcp && git commit -m "Render a job VM's startup script and a G
 def test_the_first_pair_with_room_wins_and_the_answer_prices_it(cfg):
     fc = FakeCompute({("us-west4-a", "e2-standard-2"): "exhausted", ("us-west4-b", "e2-standard-2"): "ok"})
     a = launch(REQ, fc, cfg, clock())
-    assert a == {"id": "superci-1", "kind": "e2-standard-2", "usd_per_hour": 0.0104, "spot": True}
+    assert a == {"id": "superci-1-d9cae0db", "kind": "e2-standard-2", "usd_per_hour": 0.0104, "spot": True}  # (d9cae0db: sha256("QUJD"))
     assert fc.inserted[-1]["zone"] == "us-west4-b" and fc.inserted[-1]["body"]["scheduling"]["provisioningModel"] == "SPOT"
 
 def test_every_pair_exhausted_is_no_room_and_the_fallback_starts_on_demand(cfg): ...
@@ -537,7 +537,9 @@ def test_every_pair_exhausted_is_no_room_and_the_fallback_starts_on_demand(cfg):
 
 def test_an_insert_still_running_at_the_budget_is_answered_as_started(cfg): ...  # plan "slow": answer has the id; one insert only
 
-def test_a_second_launch_for_the_same_name_answers_the_existing_vm(cfg): ...  # Review Focus
+def test_a_second_launch_with_the_same_jit_answers_the_existing_vm(cfg): ...  # Review Focus
+def test_a_launch_for_the_same_name_with_a_new_jit_makes_a_new_vm(cfg): ...  # Review Focus
+def test_a_vm_of_that_name_that_is_stopping_or_terminated_is_no_room_and_nothing_is_inserted(cfg, status): ...  # Review Focus: 429
 
 def test_an_unexpected_error_is_raised_and_a_bad_request_is_a_value_error(cfg): ...  # "error:PERMISSION_DENIED …" -> RuntimeError; missing jit -> ValueError
 

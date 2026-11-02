@@ -5,20 +5,26 @@ import time
 import pytest
 
 from fake_compute import FakeCompute, clock
-from launcher import launch, stop, sweep
+from launcher import launch, stop, sweep, vm_name
 
 ZONE_A, ZONE_B, ZONE_C = "us-west4-a", "us-west4-b", "us-west4-c"
 REQ = {"name": "superci-1", "max_minutes": 60, "cpu": 2, "ram_gb": 8, "jit": "QUJD"}
 SECRET = {"x-superci-sweep": "sweep-secret"}
 
 
+def vm(name: str) -> str:
+    """The instance name `launch` gives the VM of runner `name` with REQ's runner configuration (the id it answers)."""
+    return vm_name(name, REQ["jit"])
+
+
 def made(fc, cfg, name, zone=ZONE_A, *, aged_min=0.0, max_minutes=60, now):
-    """A VM that `launch` made in `zone` `aged_min` minutes before `now` (so its labels are the ones launch writes)."""
+    """A VM that `launch` made for runner `name` in `zone` `aged_min` minutes before `now` (so its labels are the ones launch
+    writes): its zone and the id launch answered, which is what the plane holds and stops it by."""
     plan, wall = fc.plan, fc.wall
     fc.plan, fc.wall = {(zone, "e2-standard-2"): "ok"}, lambda: now - aged_min * 60
-    launch({**REQ, "name": name, "max_minutes": max_minutes}, fc, cfg, clock())
+    answer = launch({**REQ, "name": name, "max_minutes": max_minutes}, fc, cfg, clock())
     fc.plan, fc.wall = plan, wall
-    return zone, name
+    return zone, answer["id"]
 
 
 def fails(error: Exception):
@@ -34,14 +40,14 @@ def bearer(mint) -> dict:
 
 def test_stop_deletes_wherever_the_vm_is_and_is_quiet_when_it_is_gone(cfg, now):
     fc = FakeCompute()
-    made(fc, cfg, "in-a", ZONE_A, now=now)
-    made(fc, cfg, "in-c", ZONE_C, now=now)
-    stop("in-c", fc, cfg)
-    assert fc.deleted == [(ZONE_C, "in-c")]
-    assert list(fc.vms) == [(ZONE_A, "in-a")]
-    stop("in-c", fc, cfg)  # it is gone now
+    in_a = made(fc, cfg, "in-a", ZONE_A, now=now)
+    in_c = made(fc, cfg, "in-c", ZONE_C, now=now)
+    stop(in_c[1], fc, cfg)
+    assert fc.deleted == [in_c]
+    assert list(fc.vms) == [in_a]
+    stop(in_c[1], fc, cfg)  # it is gone now
     stop("never-was", fc, cfg)
-    assert fc.deleted == [(ZONE_C, "in-c")] and list(fc.vms) == [(ZONE_A, "in-a")]
+    assert fc.deleted == [in_c] and list(fc.vms) == [in_a]
 
 
 def test_stop_deletes_a_name_in_every_zone_that_has_it(cfg):
@@ -54,41 +60,41 @@ def test_stop_deletes_a_name_in_every_zone_that_has_it(cfg):
 
 def test_stop_leaves_a_vm_of_that_name_that_is_not_this_planes_and_is_quiet_about_it(cfg, now):
     fc = FakeCompute({(ZONE_B, "e2-standard-2"): "ok", (ZONE_C, "e2-standard-2"): "ok"})
-    made(fc, dataclasses.replace(cfg, plane_id="p2"), "theirs", ZONE_A, now=now)  # another plane's
-    fc.insert(ZONE_B, {"name": "theirs", "machineType": f"zones/{ZONE_B}/machineTypes/e2-standard-2"})  # no labels at all
-    fc.insert(ZONE_C, {"name": "theirs", "machineType": f"zones/{ZONE_C}/machineTypes/e2-standard-2", "labels": {"owner": "someone"}})  # none of ours
-    stop("theirs", fc, cfg)
-    assert fc.deleted == [] and sorted(fc.vms) == [(ZONE_A, "theirs"), (ZONE_B, "theirs"), (ZONE_C, "theirs")]
+    _, theirs = made(fc, dataclasses.replace(cfg, plane_id="p2"), "theirs", ZONE_A, now=now)  # another plane's
+    fc.insert(ZONE_B, {"name": theirs, "machineType": f"zones/{ZONE_B}/machineTypes/e2-standard-2"})  # no labels at all
+    fc.insert(ZONE_C, {"name": theirs, "machineType": f"zones/{ZONE_C}/machineTypes/e2-standard-2", "labels": {"owner": "someone"}})  # none of ours
+    stop(theirs, fc, cfg)
+    assert fc.deleted == [] and sorted(fc.vms) == [(ZONE_A, theirs), (ZONE_B, theirs), (ZONE_C, theirs)]
 
 
 def test_stop_deletes_only_the_vm_of_its_own_plane_when_another_plane_has_the_name_in_another_zone(cfg, now):
     fc = FakeCompute({(ZONE_A, "e2-standard-2"): "ok"})
-    made(fc, cfg, "shared", ZONE_B, now=now)
-    fc.insert(ZONE_A, {"name": "shared", "machineType": f"zones/{ZONE_A}/machineTypes/e2-standard-2", "labels": {"superci-plane": "p2"}})
-    stop("shared", fc, cfg)
-    assert fc.deleted == [(ZONE_B, "shared")] and list(fc.vms) == [(ZONE_A, "shared")]
+    ours = made(fc, cfg, "shared", ZONE_B, now=now)
+    fc.insert(ZONE_A, {"name": ours[1], "machineType": f"zones/{ZONE_A}/machineTypes/e2-standard-2", "labels": {"superci-plane": "p2"}})
+    stop(ours[1], fc, cfg)
+    assert fc.deleted == [ours] and list(fc.vms) == [(ZONE_A, ours[1])]
 
 
-def test_stop_finds_a_vm_by_the_instance_name_a_name_is_made_into(cfg, now):
+def test_stop_finds_a_vm_by_the_id_launch_answered_also_in_uppercase(cfg, now):
     fc = FakeCompute()
-    made(fc, cfg, "Acme/Widgets 7_Job", ZONE_B, now=now)  # the instance is `acme-widgets-7-job`
-    assert list(fc.vms) == [(ZONE_B, "acme-widgets-7-job")]
-    stop("Acme/Widgets 7_Job", fc, cfg)
-    assert fc.deleted == [(ZONE_B, "acme-widgets-7-job")] and fc.vms == {}
-    made(fc, cfg, "superci-9", ZONE_A, now=now)
-    stop("SUPERCI-9", fc, cfg)  # uppercase is the same name
+    key = made(fc, cfg, "Acme/Widgets 7_Job", ZONE_B, now=now)  # the instance is `acme-widgets-7-job-<8 hex digits>`
+    assert key == (ZONE_B, vm("Acme/Widgets 7_Job")) and key[1].startswith("acme-widgets-7-job-")
+    stop(key[1], fc, cfg)
+    assert fc.deleted == [key] and fc.vms == {}
+    _, nine = made(fc, cfg, "superci-9", ZONE_A, now=now)
+    stop(nine.upper(), fc, cfg)  # uppercase is the same name
     assert fc.vms == {}
 
 
 def test_sweep_deletes_only_what_is_old_or_terminated(cfg, now):
     fc = FakeCompute()
-    made(fc, cfg, "young", ZONE_A, aged_min=5, now=now)  # running, and inside its hour
-    made(fc, cfg, "old", ZONE_B, aged_min=71, now=now)  # running, and past its hour and the ten minutes after
-    made(fc, cfg, "off", ZONE_C, aged_min=5, now=now)
-    fc.vms[(ZONE_C, "off")]["status"] = "TERMINATED"
+    young = made(fc, cfg, "young", ZONE_A, aged_min=5, now=now)  # running, and inside its hour
+    old = made(fc, cfg, "old", ZONE_B, aged_min=71, now=now)  # running, and past its hour and the ten minutes after
+    off = made(fc, cfg, "off", ZONE_C, aged_min=5, now=now)
+    fc.vms[off]["status"] = "TERMINATED"
     assert sweep(fc, cfg, now) == 2
-    assert sorted(fc.deleted) == [(ZONE_B, "old"), (ZONE_C, "off")]
-    assert list(fc.vms) == [(ZONE_A, "young")]
+    assert sorted(fc.deleted) == [old, off]
+    assert list(fc.vms) == [young]
     assert sweep(fc, cfg, now) == 0 and len(fc.deleted) == 2
 
 
@@ -105,29 +111,29 @@ def test_a_vm_is_old_when_it_is_past_its_own_limit_and_ten_minutes(cfg, now, max
 
 def test_sweep_goes_by_the_labels_of_its_own_plane(cfg, now):
     fc = FakeCompute()
-    made(fc, dataclasses.replace(cfg, plane_id="p2"), "theirs", aged_min=500, now=now)
-    made(fc, cfg, "ours", aged_min=500, now=now)
+    theirs = made(fc, dataclasses.replace(cfg, plane_id="p2"), "theirs", aged_min=500, now=now)
+    ours = made(fc, cfg, "ours", aged_min=500, now=now)
     assert sweep(fc, cfg, now) == 1
-    assert fc.deleted == [(ZONE_A, "ours")] and list(fc.vms) == [(ZONE_A, "theirs")]
+    assert fc.deleted == [ours] and list(fc.vms) == [theirs]
 
 
 def test_sweep_skips_a_listed_vm_that_is_not_this_planes_even_when_the_listing_returns_it(cfg, now, monkeypatch):
     fc = FakeCompute({(ZONE_C, "e2-standard-2"): "ok"})
-    made(fc, dataclasses.replace(cfg, plane_id="p2"), "theirs", ZONE_A, aged_min=500, now=now)
-    made(fc, cfg, "ours", ZONE_B, aged_min=500, now=now)
+    theirs = made(fc, dataclasses.replace(cfg, plane_id="p2"), "theirs", ZONE_A, aged_min=500, now=now)
+    ours = made(fc, cfg, "ours", ZONE_B, aged_min=500, now=now)
     fc.insert(ZONE_C, {"name": "unlabelled", "machineType": f"zones/{ZONE_C}/machineTypes/e2-standard-2"})
     fc.vms[(ZONE_C, "unlabelled")]["status"] = "TERMINATED"
     monkeypatch.setattr(fc, "list", lambda zone, label_filter: FakeCompute.list(fc, zone, ""))  # (a listing that ignores the filter)
     assert sweep(fc, cfg, now) == 1
-    assert fc.deleted == [(ZONE_B, "ours")] and sorted(fc.vms) == [(ZONE_A, "theirs"), (ZONE_C, "unlabelled")]
+    assert fc.deleted == [ours] and sorted(fc.vms) == [theirs, (ZONE_C, "unlabelled")]
 
 
 def test_sweep_looks_in_the_zones_of_the_configuration_and_no_others(cfg, now):
     fc = FakeCompute()
-    made(fc, cfg, "elsewhere", ZONE_A, aged_min=500, now=now)
-    made(fc, cfg, "here", ZONE_B, aged_min=500, now=now)
+    elsewhere = made(fc, cfg, "elsewhere", ZONE_A, aged_min=500, now=now)
+    here = made(fc, cfg, "here", ZONE_B, aged_min=500, now=now)
     assert sweep(fc, dataclasses.replace(cfg, zones=(ZONE_B,)), now) == 1
-    assert fc.deleted == [(ZONE_B, "here")] and list(fc.vms) == [(ZONE_A, "elsewhere")]
+    assert fc.deleted == [here] and list(fc.vms) == [elsewhere]
 
 
 DAMAGED = pytest.mark.parametrize("damage", [
@@ -195,10 +201,10 @@ def test_a_delete_that_fails_is_logged_and_the_sweep_goes_on_and_counts_only_wha
     fc = FakeCompute()
     for name, zone in (("first", ZONE_A), ("stuck", ZONE_B), ("last", ZONE_C), ("after-stuck", ZONE_B)):
         made(fc, cfg, name, zone, aged_min=500, now=now)
-    refusing_to_delete(fc, monkeypatch, "stuck")
+    refusing_to_delete(fc, monkeypatch, vm("stuck"))
     with caplog.at_level(logging.WARNING):
         assert sweep(fc, cfg, now) == 3
-    assert sorted(fc.vms) == [(ZONE_B, "stuck")]  # the others were deleted, the one that refused is still there
+    assert sorted(fc.vms) == [(ZONE_B, vm("stuck"))]  # the others were deleted, the one that refused is still there
     lines = [r.getMessage() for r in caplog.records]
     assert len(lines) == 1 and ZONE_B in lines[0] and "stuck" in lines[0] and "PERMISSION_DENIED" in lines[0]
     monkeypatch.undo()
@@ -208,7 +214,7 @@ def test_a_delete_that_fails_is_logged_and_the_sweep_goes_on_and_counts_only_wha
 # The routes.
 
 def test_sweep_route_needs_its_secret(client_with_fake, fake, cfg, mint):
-    made(fake, cfg, "old", aged_min=500, now=time.time())
+    old = made(fake, cfg, "old", aged_min=500, now=time.time())
     wrong = [{}, {"x-superci-sweep": "wrong"}, {"x-superci-sweep": "sweep-secre"}, {"x-superci-sweep": "sweep-secrets"},
              {"x-superci-sweep": ""}, {"x-superci-sweep": "swéep".encode("latin-1")}, bearer(mint)]  # (a plane's token opens nothing here)
     for headers in wrong:
@@ -217,7 +223,7 @@ def test_sweep_route_needs_its_secret(client_with_fake, fake, cfg, mint):
     assert fake.deleted == []
     r = client_with_fake.post("/sweep", headers=SECRET)
     assert (r.status_code, r.json()) == (200, {"swept": 1})
-    assert fake.deleted == [(ZONE_A, "old")]
+    assert fake.deleted == [old]
     assert client_with_fake.post("/sweep", headers=SECRET).json() == {"swept": 0}
 
 
@@ -232,7 +238,7 @@ def test_sweep_route_is_closed_when_no_secret_is_configured(app_module, client_w
 def test_a_sweep_that_cannot_list_is_503_and_one_that_cannot_delete_a_vm_counts_the_others(client_with_fake, fake, cfg, monkeypatch):
     made(fake, cfg, "stuck", aged_min=500, now=time.time())
     made(fake, cfg, "gone", aged_min=500, now=time.time())
-    refusing_to_delete(fake, monkeypatch, "stuck")
+    refusing_to_delete(fake, monkeypatch, vm("stuck"))
     r = client_with_fake.post("/sweep", headers=SECRET)
     assert (r.status_code, r.json()) == (200, {"swept": 1})
     monkeypatch.setattr(fake, "list", fails(RuntimeError("UNAVAILABLE: later")))
@@ -241,30 +247,30 @@ def test_a_sweep_that_cannot_list_is_503_and_one_that_cannot_delete_a_vm_counts_
 
 
 def test_stop_route(client_with_fake, fake, cfg, mint, monkeypatch):
-    made(fake, cfg, "superci-1", now=time.time())
+    _, ours = made(fake, cfg, "superci-1", now=time.time())
     post = lambda body: client_with_fake.post("/stop", json=body, headers=bearer(mint))
-    r = post({"id": "superci-1"})
+    r = post({"id": ours})
     assert (r.status_code, r.json()) == (200, {"stopped": True})
     assert fake.vms == {}
-    r = post({"id": "superci-1"})  # gone already
+    r = post({"id": ours})  # gone already
     assert (r.status_code, r.json()) == (200, {"stopped": True})
-    for body in ({}, {"id": ""}, {"id": 5}, {"id": None}, {"name": "superci-1"}):
+    for body in ({}, {"id": ""}, {"id": 5}, {"id": None}, {"name": ours}):
         r = post(body)
         assert r.status_code == 400 and "id" in r.json()["detail"], body
-    made(fake, dataclasses.replace(cfg, plane_id="p2"), "theirs", now=time.time())
-    r = post({"id": "theirs"})  # another plane's: not stopped, and the plane is answered all the same
+    theirs = made(fake, dataclasses.replace(cfg, plane_id="p2"), "theirs", now=time.time())
+    r = post({"id": theirs[1]})  # another plane's: not stopped, and the plane is answered all the same
     assert (r.status_code, r.json()) == (200, {"stopped": True})
-    assert list(fake.vms) == [(ZONE_A, "theirs")]
-    assert client_with_fake.post("/stop", json={"id": "superci-1"}).status_code == 401
+    assert list(fake.vms) == [theirs]
+    assert client_with_fake.post("/stop", json={"id": ours}).status_code == 401
     monkeypatch.setattr(fake, "get", fails(RuntimeError("UNAVAILABLE: later")))
-    r = post({"id": "superci-1"})
+    r = post({"id": ours})
     assert (r.status_code, r.json()) == (503, {"detail": "UNAVAILABLE: later"})
 
 
 # The sweep that /stop runs first (a /launch does not, so that it keeps its time budget).
 
 def test_a_stop_sweeps_first_once_more_than_ten_minutes_have_passed_since_the_last_sweep(app_module, client_with_fake, fake, cfg, mint):
-    made(fake, cfg, "old", aged_min=500, now=time.time())
+    old = made(fake, cfg, "old", aged_min=500, now=time.time())
     request = lambda: client_with_fake.post("/stop", json={"id": "other"}, headers=bearer(mint))
     assert request().status_code == 200
     assert fake.deleted == []  # the first request since the process started does not sweep
@@ -273,34 +279,34 @@ def test_a_stop_sweeps_first_once_more_than_ten_minutes_have_passed_since_the_la
     assert fake.deleted == []  # nor does one inside the ten minutes
     app_module.last_sweep = time.monotonic() - 610
     assert request().status_code == 200
-    assert fake.deleted == [(ZONE_A, "old")]
+    assert fake.deleted == [old]
     made(fake, cfg, "older", aged_min=500, now=time.time())
     assert request().status_code == 200
-    assert fake.deleted == [(ZONE_A, "old")]  # that was the last sweep: not again
+    assert fake.deleted == [old]  # that was the last sweep: not again
 
 
 def test_a_launch_does_not_sweep_however_long_it_has_been(app_module, client_with_fake, fake, cfg, mint):
-    made(fake, cfg, "old", aged_min=500, now=time.time())
+    old = made(fake, cfg, "old", aged_min=500, now=time.time())
     fake.plan = {(ZONE_A, "e2-standard-2"): "ok"}
     long_ago = app_module.last_sweep = time.monotonic() - 100_000
     listed = []
     real_list = fake.list
     fake.list = lambda zone, label_filter: listed.append(zone) or real_list(zone, label_filter)
     r = client_with_fake.post("/launch", json={**REQ, "name": "fresh"}, headers=bearer(mint))
-    assert r.status_code == 200 and r.json()["id"] == "fresh"
+    assert r.status_code == 200 and r.json()["id"] == vm("fresh")
     assert listed == [] and fake.deleted == []  # no list call, so none of the time a sweep takes
     assert app_module.last_sweep == long_ago  # and it is not taken as a sweep: the next stop still sweeps
     client_with_fake.post("/stop", json={"id": "other"}, headers=bearer(mint))
-    assert fake.deleted == [(ZONE_A, "old")]
+    assert fake.deleted == [old]
 
 
 def test_a_call_of_sweep_counts_as_the_last_sweep(app_module, client_with_fake, fake, cfg, mint):
-    made(fake, cfg, "old", aged_min=500, now=time.time())
+    old = made(fake, cfg, "old", aged_min=500, now=time.time())
     app_module.last_sweep = time.monotonic() - 610
     assert client_with_fake.post("/sweep", headers=SECRET).json() == {"swept": 1}
     made(fake, cfg, "older", aged_min=500, now=time.time())
     assert client_with_fake.post("/stop", json={"id": "x"}, headers=bearer(mint)).status_code == 200
-    assert fake.deleted == [(ZONE_A, "old")]
+    assert fake.deleted == [old]
 
 
 @pytest.mark.parametrize("error", [RuntimeError("UNAVAILABLE: later"), KeyError("name")], ids=["GCE failed", "something unexpected"])

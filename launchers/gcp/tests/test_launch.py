@@ -1,4 +1,5 @@
 import dataclasses
+import hashlib
 import inspect
 import json
 import time
@@ -17,6 +18,13 @@ REQ = {"name": "superci-1", "job": 4711, "repo": "Acme/Widgets.git", "max_minute
        "disk_gb": 60, "location": "wnam", "jit": "QUJD", "notice": NOTICE}  # (no "spot": that means spot)
 
 
+def jit_hash(jit: str) -> str:
+    return hashlib.sha256(jit.encode()).hexdigest()[:8]
+
+
+ID = "superci-1-" + jit_hash("QUJD")  # the instance name of REQ's VM: its runner name, then its runner configuration's hash
+
+
 def without(*keys) -> dict:
     return {k: v for k, v in REQ.items() if k not in keys}
 
@@ -28,7 +36,7 @@ def startup_script(body: dict) -> str:
 def test_the_first_pair_with_room_wins_and_the_answer_prices_it(cfg):
     fc = FakeCompute({("us-west4-a", "e2-standard-2"): "exhausted", ("us-west4-b", "e2-standard-2"): "ok"})
     a = launch(REQ, fc, cfg, clock())
-    assert a == {"id": "superci-1", "kind": "e2-standard-2", "usd_per_hour": 0.0104, "spot": True}
+    assert a == {"id": ID, "kind": "e2-standard-2", "usd_per_hour": 0.0104, "spot": True}
     assert fc.inserted[-1]["zone"] == "us-west4-b" and fc.inserted[-1]["body"]["scheduling"]["provisioningModel"] == "SPOT"
     assert len(fc.inserted) == 2
 
@@ -59,7 +67,7 @@ def test_the_fallback_starts_an_on_demand_vm_of_the_first_type_in_the_first_zone
     cfg = dataclasses.replace(cfg, on_demand_fallback=True)
     fc = FakeCompute({("us-west4-a", "e2-standard-2", "on-demand"): "ok"})
     a = launch(REQ, fc, cfg, clock())
-    assert a == {"id": "superci-1", "kind": "e2-standard-2", "usd_per_hour": 0.0755, "spot": False}
+    assert a == {"id": ID, "kind": "e2-standard-2", "usd_per_hour": 0.0755, "spot": False}
     assert len(fc.inserted) == 10  # the nine spot pairs, then this
     last = fc.inserted[-1]
     assert last["zone"] == "us-west4-a" and last["body"]["machineType"].endswith("/e2-standard-2")
@@ -82,7 +90,7 @@ def test_a_fallback_that_finds_no_room_either_is_no_room_and_any_other_failure_o
 def test_an_insert_still_running_at_the_budget_is_answered_as_started(cfg):
     fc = FakeCompute({("us-west4-a", "e2-standard-2"): "slow"})
     a = launch(REQ, fc, cfg, clock())
-    assert a == {"id": "superci-1", "kind": "e2-standard-2", "usd_per_hour": 0.0104, "spot": True}
+    assert a == {"id": ID, "kind": "e2-standard-2", "usd_per_hour": 0.0104, "spot": True}
     assert len(fc.inserted) == 1
 
 
@@ -114,7 +122,8 @@ def test_the_fallback_is_not_tried_when_the_budget_is_spent_by_then(cfg):
     assert len(fc.inserted) == 9
 
 
-def test_a_second_launch_for_the_same_name_answers_the_existing_vm(cfg):
+def test_a_second_launch_with_the_same_jit_answers_the_existing_vm(cfg):
+    # (The plane asking again after a timeout sends the same request: the VM its first call made is the answer.)
     fc = FakeCompute({("us-west4-a", "e2-standard-2"): "exhausted", ("us-west4-b", "e2-standard-2"): "ok"})
     first = launch(REQ, fc, cfg, clock())
     assert len(fc.inserted) == 2
@@ -123,13 +132,37 @@ def test_a_second_launch_for_the_same_name_answers_the_existing_vm(cfg):
     assert len(fc.inserted) == 2
 
 
+def test_a_launch_for_the_same_name_with_a_new_jit_makes_a_new_vm(cfg):
+    # After a failed start the plane withdraws the runner at GitHub and registers a new JIT configuration under the same runner
+    # name; a late machine is stopped and launched again the same way. The VM of the withdrawn configuration is not the answer.
+    fc = FakeCompute({("us-west4-a", "e2-standard-2"): "ok"})
+    first = launch(REQ, fc, cfg, clock())
+    again = launch({**REQ, "jit": "QUJE"}, fc, cfg, clock())
+    assert first["id"] == ID and again["id"] == "superci-1-" + jit_hash("QUJE")
+    assert len(fc.inserted) == 2 and fc.inserted[1]["body"]["name"] == again["id"]
+    assert "--jitconfig QUJE" in startup_script(fc.inserted[1]["body"])
+    assert fc.inserted[1]["body"]["labels"] == fc.inserted[0]["body"]["labels"]  # (the labels are the request's, as before)
+    assert set(fc.vms) == {("us-west4-a", first["id"]), ("us-west4-a", again["id"])}
+
+
+@pytest.mark.parametrize("status", ["STOPPING", "TERMINATED"])
+def test_a_vm_of_that_name_that_is_stopping_or_terminated_is_no_room_and_nothing_is_inserted(cfg, status):
+    fc = FakeCompute({(z, t): "ok" for z in ZONES for t in TYPES})
+    launch(REQ, fc, cfg, clock())
+    fc.vms[("us-west4-a", ID)]["status"] = status
+    with pytest.raises(NoRoom) as e:
+        launch(REQ, fc, cfg, clock())
+    assert str(e.value) == f"{status}: VM {ID} in us-west4-a" and e.value.spot is True
+    assert len(fc.inserted) == 1
+
+
 def test_the_existing_vm_is_answered_as_it_is_whichever_zone_it_is_in_and_not_as_the_request_asks(cfg):
     fc = FakeCompute({("us-west4-c", "n2d-standard-2", "on-demand"): "ok"})
-    fc.vms[("us-west4-c", "superci-1")] = {"name": "superci-1", "status": "RUNNING",
+    fc.vms[("us-west4-c", ID)] = {"name": ID, "status": "RUNNING",
         "machineType": "https://www.googleapis.com/compute/v1/projects/superci-test/zones/us-west4-c/machineTypes/n2d-standard-2",
         "scheduling": {"provisioningModel": "STANDARD"}}
     a = launch(REQ, fc, cfg, clock())
-    assert a == {"id": "superci-1", "kind": "n2d-standard-2", "usd_per_hour": 0.0952, "spot": False}
+    assert a == {"id": ID, "kind": "n2d-standard-2", "usd_per_hour": 0.0952, "spot": False}
     assert fc.inserted == []
 
 
@@ -137,8 +170,10 @@ def test_the_id_is_an_instance_name_gce_accepts_and_the_vm_is_found_again_by_it(
     fc = FakeCompute({("us-west4-a", "e2-standard-2"): "ok"})
     req = {**REQ, "name": "SuperCI.Acme_1"}
     a = launch(req, fc, cfg, clock())
-    assert a["id"] == "superci-acme-1" == fc.inserted[0]["body"]["name"]
+    assert a["id"] == "superci-acme-1-" + jit_hash("QUJD") == fc.inserted[0]["body"]["name"]
     assert launch(req, fc, cfg, clock()) == a and len(fc.inserted) == 1
+    long = launch({**REQ, "name": "A" * 80}, fc, cfg, clock())  # (cut to 54 characters, then the hash: 63, GCE's limit)
+    assert long["id"] == "a" * 54 + "-" + jit_hash("QUJD") and len(long["id"]) == 63
 
 
 def test_an_unexpected_error_is_raised_and_ends_the_walk(cfg):
@@ -171,7 +206,7 @@ def test_the_vm_body_of_a_spot_request(cfg):
     fc = FakeCompute({("us-west4-a", "e2-standard-2"): "ok"})
     launch(REQ, fc, cfg, clock())
     assert fc.inserted[0]["body"] == {
-        "name": "superci-1",
+        "name": ID,
         "machineType": "zones/us-west4-a/machineTypes/e2-standard-2",
         "disks": [{"boot": True, "autoDelete": True, "type": "PERSISTENT", "initializeParams": {
             "sourceImage": "projects/superci-test/global/images/family/superci-runner",
@@ -189,7 +224,7 @@ def test_the_vm_body_of_a_spot_request(cfg):
 def test_spot_false_makes_an_on_demand_vm_with_no_notice(cfg):
     fc = FakeCompute({("us-west4-a", "e2-standard-2"): "ok"})
     a = launch({**REQ, "spot": False}, fc, cfg, clock())
-    assert a == {"id": "superci-1", "kind": "e2-standard-2", "usd_per_hour": 0.0755, "spot": False}
+    assert a == {"id": ID, "kind": "e2-standard-2", "usd_per_hour": 0.0755, "spot": False}
     body = fc.inserted[0]["body"]
     assert body["scheduling"] == {"onHostMaintenance": "TERMINATE"}
     assert body["networkInterfaces"][0]["nicType"] == "GVNIC"
@@ -265,7 +300,7 @@ def test_the_vm_body_is_a_compute_instance_as_googles_client_reads_it(cfg, req, 
     fc = FakeCompute({(z, t): "ok" for z in ZONES for t in ("e2-standard-2", "e2-standard-8")})
     launch(req, fc, dataclasses.replace(cfg, **config), clock())
     instance = compute_v1.Instance.from_json(json.dumps(fc.inserted[0]["body"]))
-    assert instance.name == "superci-1" and instance.disks[0].initialize_params.disk_size_gb == 60
+    assert instance.name == ID and instance.disks[0].initialize_params.disk_size_gb == 60
     assert (instance.scheduling.provisioning_model == "SPOT") == req.get("spot", True)
     assert bool(instance.network_interfaces[0].access_configs) == (not config)
     assert instance.network_interfaces[0].nic_type == "GVNIC"
@@ -287,7 +322,7 @@ def test_the_http_layer_maps_errors(client_with_fake, fake, mint):
 
     fake.plan[("us-west4-a", "e2-standard-2")] = "ok"
     r = post(REQ)
-    assert (r.status_code, r.json()) == (200, {"id": "superci-1", "kind": "e2-standard-2", "usd_per_hour": 0.0104, "spot": True})
+    assert (r.status_code, r.json()) == (200, {"id": ID, "kind": "e2-standard-2", "usd_per_hour": 0.0104, "spot": True})
 
     fake.plan.clear()  # room nowhere
     r = post({**REQ, "name": "superci-2"})
@@ -306,6 +341,15 @@ def test_the_http_layer_maps_errors(client_with_fake, fake, mint):
     r = post({**without("jit"), "gitlab": {"url": "https://gitlab.example", "token": "t"}})
     assert r.status_code == 400 and "GitLab" in r.json()["detail"]
     assert len(fake.vms) == 1  # only the first launch made a VM
+
+
+def test_a_launch_that_finds_its_vm_stopping_is_answered_429(client_with_fake, fake, mint):
+    fake.plan[("us-west4-a", "e2-standard-2")] = "ok"
+    assert client_with_fake.post("/launch", json=REQ, headers=bearer(mint)).status_code == 200
+    fake.vms[("us-west4-a", ID)]["status"] = "STOPPING"
+    r = client_with_fake.post("/launch", json=REQ, headers=bearer(mint))
+    assert (r.status_code, r.json()) == (429, {"detail": f"no spot room in us-west4 (STOPPING: VM {ID} in us-west4-a)"})
+    assert len(fake.inserted) == 1
 
 
 def test_a_retried_launch_over_http_answers_the_same_vm(client_with_fake, fake, mint):

@@ -8,8 +8,10 @@ with 401 and `not allowed: <why>`.
 
 `POST /launch` starts a job's VM. It picks the smallest standard machine type that fits (`e2`, then `c4d`, then `n2d`) and
 walks them, and in each the zones, inserting the VM until one has room, all within about eight seconds (each insert
-waits at most five). It answers `{"id", "kind", "usd_per_hour", "spot"}`; the id is the instance name, and asking
-again for the same runner name answers the VM already made. `429 {"detail"}` means no room (the plane waits and asks again),
+waits at most five). It answers `{"id", "kind", "usd_per_hour", "spot"}`; the id is the instance name, the runner name made
+an instance name and cut to 54 characters, then `-` and the first 8 hex digits of the SHA-256 of the request's `jit`. Asking
+again with the same `jit` answers the VM already made; a new `jit` under the same runner name gets a new VM, and a VM of that
+name found `STOPPING` or `TERMINATED` is answered 429. `429 {"detail"}` means no room (the plane waits and asks again),
 `503` that GCE failed another way (the plane retries), `400` that the request is refused (for instance a GitLab job, which
 has no `jit`). With `ON_DEMAND_FALLBACK=1`, when no spot room is found it starts one on-demand VM of the first machine type in
 the first zone instead.
