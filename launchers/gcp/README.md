@@ -14,13 +14,15 @@ again for the same runner name answers the VM already made. `429 {"detail"}` mea
 has no `jit`). With `ON_DEMAND_FALLBACK=1`, when no spot room is found it starts one on-demand VM of the first machine type in
 the first zone instead.
 
-`POST /stop` with `{"id": "<instance name>"}` deletes that VM in every zone that has it and answers `{"stopped": true}`, also
-when it is gone already. `POST /sweep` deletes this plane's job VMs (label `superci-plane=<plane id>`) in every zone that are
-`TERMINATED` or older than their `superci-max-minutes` label plus 10 minutes, and answers `{"swept": n}`; a VM whose label or
-creation time cannot be read is left alone. It is for something that calls it on a timer, so it takes no plane token: the header
-`x-superci-sweep` must equal `SWEEP_SECRET`, or the answer is 404. `/launch` and `/stop` also run that sweep first when more than
-600 seconds have passed since the last one (the first request after the start does not); a failure in it is logged and the
-request is answered.
+`POST /stop` with `{"id": "<instance name>"}` deletes that VM (the name is made an instance name first) in every zone that has
+it and answers `{"stopped": true}`, also when it is gone already. Only a VM labelled `superci-plane=<plane id>` is deleted; one
+of that name without the label is left alone and the answer is the same.
+
+`POST /sweep` deletes this plane's job VMs (label `superci-plane=<plane id>`) in every zone that are `TERMINATED` or older than
+their `superci-max-minutes` label plus 10 minutes, and answers `{"swept": n}`; a VM whose label or creation time cannot be read
+is left alone. It is for something that calls it on a timer, so it takes no plane token: the header `x-superci-sweep` must equal
+`SWEEP_SECRET`, or the answer is 404. `/launch` and `/stop` also run that sweep first when more than 600 seconds have passed
+since the last one (the first request after the start does not); a failure in it is logged and the request is answered.
 
 ## Configuration
 

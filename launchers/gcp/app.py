@@ -81,8 +81,9 @@ def launch(body: dict = Depends(checked), compute: Compute = Depends(get_compute
 
 @api.post("/stop")
 def stop(body: dict = Depends(checked), compute: Compute = Depends(get_compute)):
-    """Deletes the VM whose instance name is `id` (see `launcher.stop`), after the sweep if one is due, and answers `{"stopped": true}`
-    whether or not it was there. 400 for no `id`, 503 when GCE failed and the plane may try again."""
+    """Deletes this plane's VM whose instance name is `id` (see `launcher.stop`), after the sweep if one is due, and answers
+    `{"stopped": true}` whether or not it was there (a VM of that name that is not this plane's is left, and answered the same).
+    400 for no `id`, 503 when GCE failed and the plane may try again."""
     sweep_first(compute)
     name = body.get("id")
     if not isinstance(name, str) or not name:

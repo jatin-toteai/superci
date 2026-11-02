@@ -48,9 +48,37 @@ def test_stop_deletes_wherever_the_vm_is_and_is_quiet_when_it_is_gone(cfg, now):
 def test_stop_deletes_a_name_in_every_zone_that_has_it(cfg):
     fc = FakeCompute({(z, "e2-standard-2"): "ok" for z in (ZONE_A, ZONE_B)})
     for zone in (ZONE_A, ZONE_B):  # (overlapping launches of one runner can make two)
-        fc.insert(zone, {"name": "twice", "machineType": f"zones/{zone}/machineTypes/e2-standard-2"})
+        fc.insert(zone, {"name": "twice", "machineType": f"zones/{zone}/machineTypes/e2-standard-2", "labels": {"superci-plane": cfg.plane_id}})
     stop("twice", fc, cfg)
     assert fc.deleted == [(ZONE_A, "twice"), (ZONE_B, "twice")] and fc.vms == {}
+
+
+def test_stop_leaves_a_vm_of_that_name_that_is_not_this_planes_and_is_quiet_about_it(cfg, now):
+    fc = FakeCompute({(ZONE_B, "e2-standard-2"): "ok", (ZONE_C, "e2-standard-2"): "ok"})
+    made(fc, dataclasses.replace(cfg, plane_id="p2"), "theirs", ZONE_A, now=now)  # another plane's
+    fc.insert(ZONE_B, {"name": "theirs", "machineType": f"zones/{ZONE_B}/machineTypes/e2-standard-2"})  # no labels at all
+    fc.insert(ZONE_C, {"name": "theirs", "machineType": f"zones/{ZONE_C}/machineTypes/e2-standard-2", "labels": {"owner": "someone"}})  # none of ours
+    stop("theirs", fc, cfg)
+    assert fc.deleted == [] and sorted(fc.vms) == [(ZONE_A, "theirs"), (ZONE_B, "theirs"), (ZONE_C, "theirs")]
+
+
+def test_stop_deletes_only_the_vm_of_its_own_plane_when_another_plane_has_the_name_in_another_zone(cfg, now):
+    fc = FakeCompute({(ZONE_A, "e2-standard-2"): "ok"})
+    made(fc, cfg, "shared", ZONE_B, now=now)
+    fc.insert(ZONE_A, {"name": "shared", "machineType": f"zones/{ZONE_A}/machineTypes/e2-standard-2", "labels": {"superci-plane": "p2"}})
+    stop("shared", fc, cfg)
+    assert fc.deleted == [(ZONE_B, "shared")] and list(fc.vms) == [(ZONE_A, "shared")]
+
+
+def test_stop_finds_a_vm_by_the_instance_name_a_name_is_made_into(cfg, now):
+    fc = FakeCompute()
+    made(fc, cfg, "Acme/Widgets 7_Job", ZONE_B, now=now)  # the instance is `acme-widgets-7-job`
+    assert list(fc.vms) == [(ZONE_B, "acme-widgets-7-job")]
+    stop("Acme/Widgets 7_Job", fc, cfg)
+    assert fc.deleted == [(ZONE_B, "acme-widgets-7-job")] and fc.vms == {}
+    made(fc, cfg, "superci-9", ZONE_A, now=now)
+    stop("SUPERCI-9", fc, cfg)  # uppercase is the same name
+    assert fc.vms == {}
 
 
 def test_sweep_deletes_only_what_is_old_or_terminated(cfg, now):
@@ -82,6 +110,17 @@ def test_sweep_goes_by_the_labels_of_its_own_plane(cfg, now):
     made(fc, cfg, "ours", aged_min=500, now=now)
     assert sweep(fc, cfg, now) == 1
     assert fc.deleted == [(ZONE_A, "ours")] and list(fc.vms) == [(ZONE_A, "theirs")]
+
+
+def test_sweep_skips_a_listed_vm_that_is_not_this_planes_even_when_the_listing_returns_it(cfg, now, monkeypatch):
+    fc = FakeCompute({(ZONE_C, "e2-standard-2"): "ok"})
+    made(fc, dataclasses.replace(cfg, plane_id="p2"), "theirs", ZONE_A, aged_min=500, now=now)
+    made(fc, cfg, "ours", ZONE_B, aged_min=500, now=now)
+    fc.insert(ZONE_C, {"name": "unlabelled", "machineType": f"zones/{ZONE_C}/machineTypes/e2-standard-2"})
+    fc.vms[(ZONE_C, "unlabelled")]["status"] = "TERMINATED"
+    monkeypatch.setattr(fc, "list", lambda zone, label_filter: FakeCompute.list(fc, zone, ""))  # (a listing that ignores the filter)
+    assert sweep(fc, cfg, now) == 1
+    assert fc.deleted == [(ZONE_B, "ours")] and sorted(fc.vms) == [(ZONE_A, "theirs"), (ZONE_C, "unlabelled")]
 
 
 def test_sweep_looks_in_the_zones_of_the_configuration_and_no_others(cfg, now):
@@ -175,6 +214,10 @@ def test_stop_route(client_with_fake, fake, cfg, mint, monkeypatch):
     for body in ({}, {"id": ""}, {"id": 5}, {"id": None}, {"name": "superci-1"}):
         r = post(body)
         assert r.status_code == 400 and "id" in r.json()["detail"], body
+    made(fake, dataclasses.replace(cfg, plane_id="p2"), "theirs", now=time.time())
+    r = post({"id": "theirs"})  # another plane's: not stopped, and the plane is answered all the same
+    assert (r.status_code, r.json()) == (200, {"stopped": True})
+    assert list(fake.vms) == [(ZONE_A, "theirs")]
     assert client_with_fake.post("/stop", json={"id": "superci-1"}).status_code == 401
     monkeypatch.setattr(fake, "get", fails(RuntimeError("UNAVAILABLE: later")))
     r = post({"id": "superci-1"})

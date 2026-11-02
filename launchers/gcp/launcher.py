@@ -404,11 +404,20 @@ def launch(req: dict, compute: Compute, cfg: Config, now: Callable[[], float]) -
 
 # /stop and /sweep: delete a job's VM when the plane says its job is over, and delete the leftovers the plane never stopped.
 
+def _ours(vm: dict, cfg: Config) -> bool:
+    """Whether a VM carries the label `superci-plane=<cfg.plane_id>`, which is what makes it a job VM of this plane's."""
+    return (vm.get("labels") or {}).get("superci-plane") == cfg.plane_id
+
+
 def stop(name: str, compute: Compute, cfg: Config) -> None:
-    """Deletes the VM of that instance name (the `id` that /launch answered) in every zone of `cfg.zones` that has one; overlapping
-    launches for one runner name can have made two. No VM is no error: it is gone already, or never was. RuntimeError when GCE fails."""
+    """Deletes this plane's VM of that name in every zone of `cfg.zones` that has one; overlapping launches for one runner name can
+    have made two. The name is made an instance name (`instance_name`, which the `id` that /launch answered already is) before it is
+    looked for, and a VM of that name without this plane's label (another plane's, or none of ours) is left alone. No VM is no error:
+    it is gone already, never was, or is not this plane's. RuntimeError when GCE fails."""
+    name = instance_name(name)
     for zone in cfg.zones:
-        if compute.get(zone, name) is not None:
+        vm = compute.get(zone, name)
+        if vm is not None and _ours(vm, cfg):
             compute.delete(zone, name)
 
 
@@ -432,12 +441,12 @@ def _leftover(vm: dict, now: float) -> bool:
 
 def sweep(compute: Compute, cfg: Config, now: float) -> int:
     """Deletes this plane's leftover job VMs (`_leftover`) in every zone of `cfg.zones` and answers how many. A VM is this plane's when it
-    carries the label `superci-plane=<cfg.plane_id>`. `now` is epoch seconds, the wall clock (a `creationTimestamp` is one), not the
+    carries the label `superci-plane=<cfg.plane_id>`: the listing is filtered by it, and a VM listed without it is skipped. `now` is epoch seconds, the wall clock (a `creationTimestamp` is one), not the
     monotonic clock `launch` is given. RuntimeError when GCE fails, with the VMs after the failing one left for the next sweep."""
     swept = 0
     for zone in cfg.zones:
         for vm in compute.list(zone, f"labels.superci-plane={cfg.plane_id}"):
-            if _leftover(vm, now):
+            if _ours(vm, cfg) and _leftover(vm, now):  # (the filter selects this plane's VMs; this holds if it ever returns more)
                 compute.delete(zone, vm["name"])
                 swept += 1
     return swept
