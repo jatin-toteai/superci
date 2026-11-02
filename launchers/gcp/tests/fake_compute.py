@@ -1,8 +1,16 @@
 # A stand-in for Google Compute Engine in the launcher's tests: it models only what the launcher asks of it.
 import copy
 import re
+import time
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 
 EXHAUSTED = "ZONE_RESOURCE_POOL_EXHAUSTED: The zone does not have enough resources available to fulfill the request."
+
+
+def rfc3339(epoch: float) -> str:
+    """An epoch time as GCE writes a `creationTimestamp`: RFC 3339 with milliseconds and the project's UTC offset."""
+    return datetime.fromtimestamp(epoch, timezone(timedelta(hours=-8))).isoformat(timespec="milliseconds")
 
 
 class Clock:
@@ -34,12 +42,16 @@ class FakeCompute:
 
     With a `clock` given, an answer takes `answer_s` seconds to come and a wait that is shorter than that gives up
     after its own timeout, still running. Only a VM that was made is seen by `get`, `list` and `delete`.
+
+    A VM made is `RUNNING` and has the `creationTimestamp` of `wall()`, the time of the wall clock (epoch seconds) when it was
+    made, as GCE stamps it; a test that needs an old VM sets `wall` before the insert.
     """
 
     def __init__(self, plan: dict | None = None, clock: Clock | None = None, answer_s: float = 0.0):
         self.plan = dict(plan or {})
         self.clock = clock
         self.answer_s = answer_s
+        self.wall: Callable[[], float] = time.time
         self.inserted: list[dict] = []  # {"zone", "body"} of every insert, in order
         self.waits: list[tuple[str, float]] = []  # (zone, timeout_s) of every wait
         self.deleted: list[tuple[str, str]] = []
@@ -64,7 +76,7 @@ class FakeCompute:
         if (zone, body["name"]) in self.vms:
             raise RuntimeError("ALREADY_EXISTS: the resource already exists")
         if outcome in ("ok", "slow"):
-            self.vms[(zone, body["name"])] = {**copy.deepcopy(body), "status": "RUNNING"}
+            self.vms[(zone, body["name"])] = {**copy.deepcopy(body), "status": "RUNNING", "creationTimestamp": rfc3339(self.wall())}
         operation = f"operation-{len(self.inserted)}"
         self._outcomes[operation] = outcome
         return operation

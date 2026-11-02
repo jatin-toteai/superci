@@ -1,0 +1,246 @@
+import dataclasses
+import logging
+import time
+from datetime import datetime
+
+import pytest
+
+from fake_compute import FakeCompute, clock
+from launcher import launch, stop, sweep
+
+ZONE_A, ZONE_B, ZONE_C = "us-west4-a", "us-west4-b", "us-west4-c"
+REQ = {"name": "superci-1", "max_minutes": 60, "cpu": 2, "ram_gb": 8, "jit": "QUJD"}
+SECRET = {"x-superci-sweep": "sweep-secret"}
+
+
+def made(fc, cfg, name, zone=ZONE_A, *, aged_min=0.0, max_minutes=60, now):
+    """A VM that `launch` made in `zone` `aged_min` minutes before `now` (so its labels are the ones launch writes)."""
+    plan, wall = fc.plan, fc.wall
+    fc.plan, fc.wall = {(zone, "e2-standard-2"): "ok"}, lambda: now - aged_min * 60
+    launch({**REQ, "name": name, "max_minutes": max_minutes}, fc, cfg, clock())
+    fc.plan, fc.wall = plan, wall
+    return zone, name
+
+
+def fails(error: Exception):
+    """A stand-in for a `Compute` method that raises `error`."""
+    def call(*args):
+        raise error
+    return call
+
+
+def bearer(mint) -> dict:
+    return {"authorization": "Bearer " + mint({"exp": time.time() + 60})}
+
+
+def test_stop_deletes_wherever_the_vm_is_and_is_quiet_when_it_is_gone(cfg, now):
+    fc = FakeCompute()
+    made(fc, cfg, "in-a", ZONE_A, now=now)
+    made(fc, cfg, "in-c", ZONE_C, now=now)
+    stop("in-c", fc, cfg)
+    assert fc.deleted == [(ZONE_C, "in-c")]
+    assert list(fc.vms) == [(ZONE_A, "in-a")]
+    stop("in-c", fc, cfg)  # it is gone now
+    stop("never-was", fc, cfg)
+    assert fc.deleted == [(ZONE_C, "in-c")] and list(fc.vms) == [(ZONE_A, "in-a")]
+
+
+def test_stop_deletes_a_name_in_every_zone_that_has_it(cfg):
+    fc = FakeCompute({(z, "e2-standard-2"): "ok" for z in (ZONE_A, ZONE_B)})
+    for zone in (ZONE_A, ZONE_B):  # (overlapping launches of one runner can make two)
+        fc.insert(zone, {"name": "twice", "machineType": f"zones/{zone}/machineTypes/e2-standard-2"})
+    stop("twice", fc, cfg)
+    assert fc.deleted == [(ZONE_A, "twice"), (ZONE_B, "twice")] and fc.vms == {}
+
+
+def test_sweep_deletes_only_what_is_old_or_terminated(cfg, now):
+    fc = FakeCompute()
+    made(fc, cfg, "young", ZONE_A, aged_min=5, now=now)  # running, and inside its hour
+    made(fc, cfg, "old", ZONE_B, aged_min=71, now=now)  # running, and past its hour and the ten minutes after
+    made(fc, cfg, "off", ZONE_C, aged_min=5, now=now)
+    fc.vms[(ZONE_C, "off")]["status"] = "TERMINATED"
+    assert sweep(fc, cfg, now) == 2
+    assert sorted(fc.deleted) == [(ZONE_B, "old"), (ZONE_C, "off")]
+    assert list(fc.vms) == [(ZONE_A, "young")]
+    assert sweep(fc, cfg, now) == 0 and len(fc.deleted) == 2
+
+
+@pytest.mark.parametrize("max_minutes, aged_min, swept", [
+    (60, 59, 0), (60, 69.9, 0), (60, 70, 0), (60, 70.1, 1),  # the limit is the VM's own label plus ten minutes, and "older than" is strict
+    (30, 39.9, 0), (30, 40.1, 1), (240, 100, 0), (240, 251, 1),
+])
+def test_a_vm_is_old_when_it_is_past_its_own_limit_and_ten_minutes(cfg, now, max_minutes, aged_min, swept):
+    fc = FakeCompute()
+    made(fc, cfg, "vm", aged_min=aged_min, max_minutes=max_minutes, now=now)
+    assert sweep(fc, cfg, now) == swept
+    assert len(fc.deleted) == swept
+
+
+def test_sweep_goes_by_the_labels_of_its_own_plane(cfg, now):
+    fc = FakeCompute()
+    made(fc, dataclasses.replace(cfg, plane_id="p2"), "theirs", aged_min=500, now=now)
+    made(fc, cfg, "ours", aged_min=500, now=now)
+    assert sweep(fc, cfg, now) == 1
+    assert fc.deleted == [(ZONE_A, "ours")] and list(fc.vms) == [(ZONE_A, "theirs")]
+
+
+def test_sweep_looks_in_the_zones_of_the_configuration_and_no_others(cfg, now):
+    fc = FakeCompute()
+    made(fc, cfg, "elsewhere", ZONE_A, aged_min=500, now=now)
+    made(fc, cfg, "here", ZONE_B, aged_min=500, now=now)
+    assert sweep(fc, dataclasses.replace(cfg, zones=(ZONE_B,)), now) == 1
+    assert fc.deleted == [(ZONE_B, "here")] and list(fc.vms) == [(ZONE_A, "elsewhere")]
+
+
+@pytest.mark.parametrize("damage", [
+    lambda vm: vm["labels"].pop("superci-max-minutes"),
+    lambda vm: vm.pop("labels"),
+    lambda vm: vm["labels"].update({"superci-max-minutes": "soon"}),
+    lambda vm: vm["labels"].update({"superci-max-minutes": ""}),
+    lambda vm: vm["labels"].update({"superci-max-minutes": "-5"}),
+    lambda vm: vm["labels"].update({"superci-max-minutes": "1_0"}),
+    lambda vm: vm.pop("creationTimestamp"),
+    lambda vm: vm.update(creationTimestamp="yesterday"),
+    lambda vm: vm.update(creationTimestamp="2020-01-01T00:00:00.000"),  # no offset, so no telling when
+    lambda vm: vm.update(creationTimestamp=None),
+], ids=["no label", "no labels", "label not a number", "empty label", "negative label", "underscore in label",
+        "no timestamp", "timestamp not a time", "timestamp without offset", "timestamp none"])
+@pytest.mark.parametrize("status", ["RUNNING", "TERMINATED"])
+def test_a_vm_whose_label_or_timestamp_cannot_be_read_is_left_alone_and_not_counted(cfg, now, damage, status):
+    fc = FakeCompute()
+    key = made(fc, cfg, "odd", aged_min=5000, now=now)
+    fc.vms[key]["status"] = status
+    damage(fc.vms[key])
+    assert sweep(fc, cfg, now) == 0
+    assert fc.deleted == [] and list(fc.vms) == [key]
+
+
+def test_a_vm_that_cannot_be_read_does_not_hold_back_the_others(cfg, now):
+    fc = FakeCompute()
+    odd = made(fc, cfg, "odd", ZONE_A, aged_min=5000, now=now)
+    del fc.vms[odd]["labels"]["superci-max-minutes"]
+    made(fc, cfg, "old", ZONE_A, aged_min=5000, now=now)
+    assert sweep(fc, cfg, now) == 1 and list(fc.vms) == [odd]
+
+
+def test_a_failure_to_list_or_delete_is_raised(cfg, now, monkeypatch):
+    fc = FakeCompute()
+    made(fc, cfg, "old", aged_min=500, now=now)
+    monkeypatch.setattr(fc, "delete", fails(RuntimeError("PERMISSION_DENIED: no")))
+    with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
+        sweep(fc, cfg, now)
+    monkeypatch.setattr(fc, "list", fails(RuntimeError("UNAVAILABLE: later")))
+    with pytest.raises(RuntimeError, match="UNAVAILABLE"):
+        sweep(fc, cfg, now)
+
+
+# The routes.
+
+def test_sweep_route_needs_its_secret(client_with_fake, fake, cfg, mint):
+    made(fake, cfg, "old", aged_min=500, now=time.time())
+    wrong = [{}, {"x-superci-sweep": "wrong"}, {"x-superci-sweep": "sweep-secre"}, {"x-superci-sweep": "sweep-secrets"},
+             {"x-superci-sweep": ""}, {"x-superci-sweep": "swéep".encode("latin-1")}, bearer(mint)]  # (a plane's token opens nothing here)
+    for headers in wrong:
+        r = client_with_fake.post("/sweep", headers=headers)
+        assert (r.status_code, r.json()) == (404, {"detail": "Not Found"}), headers
+    assert fake.deleted == []
+    r = client_with_fake.post("/sweep", headers=SECRET)
+    assert (r.status_code, r.json()) == (200, {"swept": 1})
+    assert fake.deleted == [(ZONE_A, "old")]
+    assert client_with_fake.post("/sweep", headers=SECRET).json() == {"swept": 0}
+
+
+def test_sweep_route_is_closed_when_no_secret_is_configured(app_module, client_with_fake, fake, cfg, monkeypatch):
+    monkeypatch.setattr(app_module.cfg, "sweep_secret", "")
+    made(fake, cfg, "old", aged_min=500, now=time.time())
+    for headers in ({}, {"x-superci-sweep": ""}):
+        assert client_with_fake.post("/sweep", headers=headers).status_code == 404
+    assert fake.deleted == []
+
+
+def test_a_sweep_that_fails_is_503(client_with_fake, fake, monkeypatch):
+    monkeypatch.setattr(fake, "list", fails(RuntimeError("UNAVAILABLE: later")))
+    r = client_with_fake.post("/sweep", headers=SECRET)
+    assert (r.status_code, r.json()) == (503, {"detail": "UNAVAILABLE: later"})
+
+
+def test_stop_route(client_with_fake, fake, cfg, mint, monkeypatch):
+    made(fake, cfg, "superci-1", now=time.time())
+    post = lambda body: client_with_fake.post("/stop", json=body, headers=bearer(mint))
+    r = post({"id": "superci-1"})
+    assert (r.status_code, r.json()) == (200, {"stopped": True})
+    assert fake.vms == {}
+    r = post({"id": "superci-1"})  # gone already
+    assert (r.status_code, r.json()) == (200, {"stopped": True})
+    for body in ({}, {"id": ""}, {"id": 5}, {"id": None}, {"name": "superci-1"}):
+        r = post(body)
+        assert r.status_code == 400 and "id" in r.json()["detail"], body
+    assert client_with_fake.post("/stop", json={"id": "superci-1"}).status_code == 401
+    monkeypatch.setattr(fake, "get", fails(RuntimeError("UNAVAILABLE: later")))
+    r = post({"id": "superci-1"})
+    assert (r.status_code, r.json()) == (503, {"detail": "UNAVAILABLE: later"})
+
+
+# The sweep a request runs first.
+
+REQUESTS = [("/launch", {**REQ, "name": "fresh"}), ("/stop", {"id": "other"})]
+
+
+@pytest.mark.parametrize("route, body", REQUESTS)
+def test_a_request_sweeps_first_once_more_than_ten_minutes_have_passed_since_the_last_sweep(app_module, client_with_fake, fake, cfg, mint, route, body):
+    made(fake, cfg, "old", aged_min=500, now=time.time())
+    fake.plan = {(ZONE_A, "e2-standard-2"): "ok"}
+    request = lambda: client_with_fake.post(route, json=body, headers=bearer(mint))
+    assert request().status_code == 200
+    assert fake.deleted == []  # the first request since the process started does not sweep
+    app_module.last_sweep = time.monotonic() - 590
+    assert request().status_code == 200
+    assert fake.deleted == []  # nor does one inside the ten minutes
+    app_module.last_sweep = time.monotonic() - 610
+    assert request().status_code == 200
+    assert fake.deleted == [(ZONE_A, "old")]
+    made(fake, cfg, "older", aged_min=500, now=time.time())
+    assert request().status_code == 200
+    assert fake.deleted == [(ZONE_A, "old")]  # that was the last sweep: not again
+
+
+def test_the_sweep_comes_before_the_launch_it_precedes(app_module, client_with_fake, fake, cfg, mint):
+    made(fake, cfg, "same-name", aged_min=500, now=time.time())
+    fake.plan = {(ZONE_A, "e2-standard-2"): "ok"}
+    app_module.last_sweep = time.monotonic() - 610
+    r = client_with_fake.post("/launch", json={**REQ, "name": "same-name"}, headers=bearer(mint))
+    assert r.status_code == 200
+    assert len(fake.inserted) == 2  # swept first, so the launch found no VM of the name and made one
+    assert fake.deleted == [(ZONE_A, "same-name")] and list(fake.vms) == [(ZONE_A, "same-name")]
+    made_at = datetime.fromisoformat(fake.vms[(ZONE_A, "same-name")]["creationTimestamp"]).timestamp()
+    assert time.time() - made_at < 60  # (the new VM, not the old one)
+
+
+def test_a_call_of_sweep_counts_as_the_last_sweep(app_module, client_with_fake, fake, cfg, mint):
+    made(fake, cfg, "old", aged_min=500, now=time.time())
+    app_module.last_sweep = time.monotonic() - 610
+    assert client_with_fake.post("/sweep", headers=SECRET).json() == {"swept": 1}
+    made(fake, cfg, "older", aged_min=500, now=time.time())
+    assert client_with_fake.post("/stop", json={"id": "x"}, headers=bearer(mint)).status_code == 200
+    assert fake.deleted == [(ZONE_A, "old")]
+
+
+@pytest.mark.parametrize("error", [RuntimeError("UNAVAILABLE: later"), KeyError("name")], ids=["GCE failed", "something unexpected"])
+@pytest.mark.parametrize("route, body", REQUESTS)
+def test_a_sweep_that_fails_does_not_fail_the_request_and_is_not_tried_again_at_once(app_module, client_with_fake, fake, mint, caplog, monkeypatch, route, body, error):
+    asked = []
+
+    def broken(zone, label_filter):
+        asked.append(zone)
+        fails(error)()
+
+    monkeypatch.setattr(fake, "list", broken)
+    fake.plan = {(ZONE_A, "e2-standard-2"): "ok"}
+    request = lambda: client_with_fake.post(route, json=body, headers=bearer(mint))
+    app_module.last_sweep = time.monotonic() - 610
+    with caplog.at_level(logging.WARNING):
+        r = request()
+    assert r.status_code == 200
+    assert asked == [ZONE_A]  # it went as far as the first list
+    assert str(error) in caplog.text  # and the failure was logged
+    assert request().status_code == 200 and asked == [ZONE_A]  # the next request does not try again
