@@ -5,6 +5,8 @@
 # build-image.sh looks for the last line, `superci: image ready`, or for `superci: image build failed`.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
+# (Ubuntu's needrestart, run after each apt-get, would otherwise ask which services to restart, or restart them, mid-build.)
+export NEEDRESTART_SUSPEND=1
 
 trap 'echo "superci: image build failed at line $LINENO" >&2' ERR
 
