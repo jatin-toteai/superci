@@ -44,7 +44,7 @@ async def checked(request: Request) -> dict:
 
 
 def sweep_first(compute: Compute) -> None:
-    """Sweeps the VMs before a request is answered when more than `SWEEP_EVERY_S` seconds have passed since the last sweep. A failure
+    """Sweeps the VMs before a /stop is answered when more than `SWEEP_EVERY_S` seconds have passed since the last sweep. A failure
     is logged and the request goes on. The time is taken when the sweep begins, so of requests that arrive together one sweeps, and
     a sweep that failed is not tried again by the next request but after the same time."""
     global last_sweep
@@ -65,10 +65,9 @@ async def health():
 
 @api.post("/launch")
 def launch(body: dict = Depends(checked), compute: Compute = Depends(get_compute)):
-    """Starts a job's VM (see `launcher.launch`), after the sweep if one is due. 429 means no room now and the plane is to wait, 503
-    that it failed and may be tried again, 400 that the request is refused. A plain `def`: Google's client blocks, so the route runs
-    in a thread, not in the event loop that answers /health."""
-    sweep_first(compute)
+    """Starts a job's VM (see `launcher.launch`). 429 means no room now and the plane is to wait, 503 that it failed and may be
+    tried again, 400 that the request is refused. A plain `def`: Google's client blocks, so the route runs in a thread, not in the
+    event loop that answers /health. It does not sweep first, as /stop does: a launch has a time budget to keep."""
     try:
         return start_vm(body, compute, cfg, time.monotonic)
     except NoRoom as e:

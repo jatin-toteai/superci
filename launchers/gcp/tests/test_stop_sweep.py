@@ -1,7 +1,6 @@
 import dataclasses
 import logging
 import time
-from datetime import datetime
 
 import pytest
 
@@ -131,9 +130,9 @@ def test_sweep_looks_in_the_zones_of_the_configuration_and_no_others(cfg, now):
     assert fc.deleted == [(ZONE_B, "here")] and list(fc.vms) == [(ZONE_A, "elsewhere")]
 
 
-@pytest.mark.parametrize("damage", [
+DAMAGED = pytest.mark.parametrize("damage", [
     lambda vm: vm["labels"].pop("superci-max-minutes"),
-    lambda vm: vm.pop("labels"),
+    lambda vm: vm.update(labels={"superci-plane": vm["labels"]["superci-plane"]}),  # (the plane label is what makes it ours)
     lambda vm: vm["labels"].update({"superci-max-minutes": "soon"}),
     lambda vm: vm["labels"].update({"superci-max-minutes": ""}),
     lambda vm: vm["labels"].update({"superci-max-minutes": "-5"}),
@@ -142,16 +141,27 @@ def test_sweep_looks_in_the_zones_of_the_configuration_and_no_others(cfg, now):
     lambda vm: vm.update(creationTimestamp="yesterday"),
     lambda vm: vm.update(creationTimestamp="2020-01-01T00:00:00.000"),  # no offset, so no telling when
     lambda vm: vm.update(creationTimestamp=None),
-], ids=["no label", "no labels", "label not a number", "empty label", "negative label", "underscore in label",
+], ids=["no label", "only the plane label", "label not a number", "empty label", "negative label", "underscore in label",
         "no timestamp", "timestamp not a time", "timestamp without offset", "timestamp none"])
-@pytest.mark.parametrize("status", ["RUNNING", "TERMINATED"])
-def test_a_vm_whose_label_or_timestamp_cannot_be_read_is_left_alone_and_not_counted(cfg, now, damage, status):
+
+
+@DAMAGED
+def test_a_running_vm_whose_label_or_timestamp_cannot_be_read_is_left_alone_and_not_counted(cfg, now, damage):
     fc = FakeCompute()
     key = made(fc, cfg, "odd", aged_min=5000, now=now)
-    fc.vms[key]["status"] = status
     damage(fc.vms[key])
     assert sweep(fc, cfg, now) == 0
     assert fc.deleted == [] and list(fc.vms) == [key]
+
+
+@DAMAGED
+def test_a_terminated_vm_of_this_plane_is_swept_whatever_its_label_and_timestamp_say(cfg, now, damage):
+    fc = FakeCompute()
+    key = made(fc, cfg, "odd", aged_min=1, now=now)
+    fc.vms[key]["status"] = "TERMINATED"
+    damage(fc.vms[key])
+    assert sweep(fc, cfg, now) == 1
+    assert fc.deleted == [key] and fc.vms == {}
 
 
 def test_a_vm_that_cannot_be_read_does_not_hold_back_the_others(cfg, now):
@@ -162,15 +172,37 @@ def test_a_vm_that_cannot_be_read_does_not_hold_back_the_others(cfg, now):
     assert sweep(fc, cfg, now) == 1 and list(fc.vms) == [odd]
 
 
-def test_a_failure_to_list_or_delete_is_raised(cfg, now, monkeypatch):
+def test_a_failure_to_list_is_raised(cfg, now, monkeypatch):
     fc = FakeCompute()
-    made(fc, cfg, "old", aged_min=500, now=now)
-    monkeypatch.setattr(fc, "delete", fails(RuntimeError("PERMISSION_DENIED: no")))
-    with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
-        sweep(fc, cfg, now)
     monkeypatch.setattr(fc, "list", fails(RuntimeError("UNAVAILABLE: later")))
     with pytest.raises(RuntimeError, match="UNAVAILABLE"):
         sweep(fc, cfg, now)
+
+
+def refusing_to_delete(fc, monkeypatch, *names):
+    """`fc.delete` as it is, but raising for the VMs of these names."""
+    real = fc.delete
+
+    def delete(zone, name):
+        if name in names:
+            raise RuntimeError(f"PERMISSION_DENIED: no delete of {name}")
+        real(zone, name)
+
+    monkeypatch.setattr(fc, "delete", delete)
+
+
+def test_a_delete_that_fails_is_logged_and_the_sweep_goes_on_and_counts_only_what_it_deleted(cfg, now, monkeypatch, caplog):
+    fc = FakeCompute()
+    for name, zone in (("first", ZONE_A), ("stuck", ZONE_B), ("last", ZONE_C), ("after-stuck", ZONE_B)):
+        made(fc, cfg, name, zone, aged_min=500, now=now)
+    refusing_to_delete(fc, monkeypatch, "stuck")
+    with caplog.at_level(logging.WARNING):
+        assert sweep(fc, cfg, now) == 3
+    assert sorted(fc.vms) == [(ZONE_B, "stuck")]  # the others were deleted, the one that refused is still there
+    lines = [r.getMessage() for r in caplog.records]
+    assert len(lines) == 1 and ZONE_B in lines[0] and "stuck" in lines[0] and "PERMISSION_DENIED" in lines[0]
+    monkeypatch.undo()
+    assert sweep(fc, cfg, now) == 1 and fc.vms == {}  # the next sweep tries it again
 
 
 # The routes.
@@ -197,7 +229,12 @@ def test_sweep_route_is_closed_when_no_secret_is_configured(app_module, client_w
     assert fake.deleted == []
 
 
-def test_a_sweep_that_fails_is_503(client_with_fake, fake, monkeypatch):
+def test_a_sweep_that_cannot_list_is_503_and_one_that_cannot_delete_a_vm_counts_the_others(client_with_fake, fake, cfg, monkeypatch):
+    made(fake, cfg, "stuck", aged_min=500, now=time.time())
+    made(fake, cfg, "gone", aged_min=500, now=time.time())
+    refusing_to_delete(fake, monkeypatch, "stuck")
+    r = client_with_fake.post("/sweep", headers=SECRET)
+    assert (r.status_code, r.json()) == (200, {"swept": 1})
     monkeypatch.setattr(fake, "list", fails(RuntimeError("UNAVAILABLE: later")))
     r = client_with_fake.post("/sweep", headers=SECRET)
     assert (r.status_code, r.json()) == (503, {"detail": "UNAVAILABLE: later"})
@@ -224,16 +261,11 @@ def test_stop_route(client_with_fake, fake, cfg, mint, monkeypatch):
     assert (r.status_code, r.json()) == (503, {"detail": "UNAVAILABLE: later"})
 
 
-# The sweep a request runs first.
+# The sweep that /stop runs first (a /launch does not, so that it keeps its time budget).
 
-REQUESTS = [("/launch", {**REQ, "name": "fresh"}), ("/stop", {"id": "other"})]
-
-
-@pytest.mark.parametrize("route, body", REQUESTS)
-def test_a_request_sweeps_first_once_more_than_ten_minutes_have_passed_since_the_last_sweep(app_module, client_with_fake, fake, cfg, mint, route, body):
+def test_a_stop_sweeps_first_once_more_than_ten_minutes_have_passed_since_the_last_sweep(app_module, client_with_fake, fake, cfg, mint):
     made(fake, cfg, "old", aged_min=500, now=time.time())
-    fake.plan = {(ZONE_A, "e2-standard-2"): "ok"}
-    request = lambda: client_with_fake.post(route, json=body, headers=bearer(mint))
+    request = lambda: client_with_fake.post("/stop", json={"id": "other"}, headers=bearer(mint))
     assert request().status_code == 200
     assert fake.deleted == []  # the first request since the process started does not sweep
     app_module.last_sweep = time.monotonic() - 590
@@ -247,16 +279,19 @@ def test_a_request_sweeps_first_once_more_than_ten_minutes_have_passed_since_the
     assert fake.deleted == [(ZONE_A, "old")]  # that was the last sweep: not again
 
 
-def test_the_sweep_comes_before_the_launch_it_precedes(app_module, client_with_fake, fake, cfg, mint):
-    made(fake, cfg, "same-name", aged_min=500, now=time.time())
+def test_a_launch_does_not_sweep_however_long_it_has_been(app_module, client_with_fake, fake, cfg, mint):
+    made(fake, cfg, "old", aged_min=500, now=time.time())
     fake.plan = {(ZONE_A, "e2-standard-2"): "ok"}
-    app_module.last_sweep = time.monotonic() - 610
-    r = client_with_fake.post("/launch", json={**REQ, "name": "same-name"}, headers=bearer(mint))
-    assert r.status_code == 200
-    assert len(fake.inserted) == 2  # swept first, so the launch found no VM of the name and made one
-    assert fake.deleted == [(ZONE_A, "same-name")] and list(fake.vms) == [(ZONE_A, "same-name")]
-    made_at = datetime.fromisoformat(fake.vms[(ZONE_A, "same-name")]["creationTimestamp"]).timestamp()
-    assert time.time() - made_at < 60  # (the new VM, not the old one)
+    long_ago = app_module.last_sweep = time.monotonic() - 100_000
+    listed = []
+    real_list = fake.list
+    fake.list = lambda zone, label_filter: listed.append(zone) or real_list(zone, label_filter)
+    r = client_with_fake.post("/launch", json={**REQ, "name": "fresh"}, headers=bearer(mint))
+    assert r.status_code == 200 and r.json()["id"] == "fresh"
+    assert listed == [] and fake.deleted == []  # no list call, so none of the time a sweep takes
+    assert app_module.last_sweep == long_ago  # and it is not taken as a sweep: the next stop still sweeps
+    client_with_fake.post("/stop", json={"id": "other"}, headers=bearer(mint))
+    assert fake.deleted == [(ZONE_A, "old")]
 
 
 def test_a_call_of_sweep_counts_as_the_last_sweep(app_module, client_with_fake, fake, cfg, mint):
@@ -269,8 +304,7 @@ def test_a_call_of_sweep_counts_as_the_last_sweep(app_module, client_with_fake, 
 
 
 @pytest.mark.parametrize("error", [RuntimeError("UNAVAILABLE: later"), KeyError("name")], ids=["GCE failed", "something unexpected"])
-@pytest.mark.parametrize("route, body", REQUESTS)
-def test_a_sweep_that_fails_does_not_fail_the_request_and_is_not_tried_again_at_once(app_module, client_with_fake, fake, mint, caplog, monkeypatch, route, body, error):
+def test_a_sweep_that_fails_does_not_fail_the_stop_and_is_not_tried_again_at_once(app_module, client_with_fake, fake, mint, caplog, monkeypatch, error):
     asked = []
 
     def broken(zone, label_filter):
@@ -278,8 +312,7 @@ def test_a_sweep_that_fails_does_not_fail_the_request_and_is_not_tried_again_at_
         fails(error)()
 
     monkeypatch.setattr(fake, "list", broken)
-    fake.plan = {(ZONE_A, "e2-standard-2"): "ok"}
-    request = lambda: client_with_fake.post(route, json=body, headers=bearer(mint))
+    request = lambda: client_with_fake.post("/stop", json={"id": "other"}, headers=bearer(mint))
     app_module.last_sweep = time.monotonic() - 610
     with caplog.at_level(logging.WARNING):
         r = request()

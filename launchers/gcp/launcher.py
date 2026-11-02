@@ -3,6 +3,7 @@
 # launcher's own URL and for the plane's subject, the way the Modal and Cloudflare launchers do.
 import base64
 import json
+import logging
 import os
 import re
 from collections.abc import Callable
@@ -16,6 +17,8 @@ import requests
 from google.api_core import exceptions as google_errors
 
 from prices import ON_DEMAND, SPOT
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -425,10 +428,12 @@ SWEEP_GRACE_MINUTES = 10  # what a VM is given beyond its `superci-max-minutes` 
 
 
 def _leftover(vm: dict, now: float) -> bool:
-    """Whether a job VM is for the sweep: it is `TERMINATED` (it powered itself off, and its disk stays until it is deleted), or it was
-    made more than its `superci-max-minutes` label plus `SWEEP_GRACE_MINUTES` before `now`. A VM whose label is not a whole number of
-    minutes, or whose `creationTimestamp` is not a time with an offset (GCE gives RFC 3339), or that has no such label or timestamp, is
-    not known to be a job's: it is not a leftover, `TERMINATED` or not."""
+    """Whether a job VM is for the sweep. A `TERMINATED` one always is: it powered itself off, and it costs its disk until it is
+    deleted. Any other is when it was made more than its `superci-max-minutes` label plus `SWEEP_GRACE_MINUTES` before `now`; for that
+    the label must be a whole number of minutes and `creationTimestamp` a time with an offset (GCE gives RFC 3339), and a VM that has
+    no such label or timestamp, or an unreadable one, is not known to be overdue and is left alone."""
+    if vm.get("status") == "TERMINATED":
+        return True
     try:
         minutes = str(vm["labels"]["superci-max-minutes"])
         created = datetime.fromisoformat(vm["creationTimestamp"])
@@ -436,18 +441,24 @@ def _leftover(vm: dict, now: float) -> bool:
         return False
     if not (minutes.isascii() and minutes.isdigit()) or created.tzinfo is None:
         return False
-    return vm.get("status") == "TERMINATED" or now - created.timestamp() > (int(minutes) + SWEEP_GRACE_MINUTES) * 60
+    return now - created.timestamp() > (int(minutes) + SWEEP_GRACE_MINUTES) * 60
 
 
 def sweep(compute: Compute, cfg: Config, now: float) -> int:
-    """Deletes this plane's leftover job VMs (`_leftover`) in every zone of `cfg.zones` and answers how many. A VM is this plane's when it
-    carries the label `superci-plane=<cfg.plane_id>`: the listing is filtered by it, and a VM listed without it is skipped. `now` is epoch seconds, the wall clock (a `creationTimestamp` is one), not the
-    monotonic clock `launch` is given. RuntimeError when GCE fails, with the VMs after the failing one left for the next sweep."""
+    """Deletes this plane's leftover job VMs (`_leftover`) in every zone of `cfg.zones` and answers how many it deleted. A VM is this
+    plane's when it carries the label `superci-plane=<cfg.plane_id>`: the listing is filtered by it, and a VM listed without it is
+    skipped. `now` is epoch seconds, the wall clock (a `creationTimestamp` is one), not the monotonic clock `launch` is given.
+    A delete that fails is logged, naming the zone and the VM, and the sweep goes on with the next one (that VM is tried again by
+    the next sweep, and is not in the count). RuntimeError when GCE fails to list."""
     swept = 0
     for zone in cfg.zones:
         for vm in compute.list(zone, f"labels.superci-plane={cfg.plane_id}"):
             if _ours(vm, cfg) and _leftover(vm, now):  # (the filter selects this plane's VMs; this holds if it ever returns more)
-                compute.delete(zone, vm["name"])
+                try:
+                    compute.delete(zone, vm["name"])
+                except Exception as e:
+                    log.error("sweep: could not delete %s in %s: %s", vm["name"], zone, e)
+                    continue
                 swept += 1
     return swept
 
