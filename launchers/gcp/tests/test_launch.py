@@ -3,8 +3,10 @@ import hashlib
 import inspect
 import json
 import time
+import types
 
 import pytest
+from google.api_core import exceptions as google_errors
 from google.cloud import compute_v1
 
 from fake_compute import FakeCompute, clock
@@ -174,6 +176,92 @@ def test_the_id_is_an_instance_name_gce_accepts_and_the_vm_is_found_again_by_it(
     assert launch(req, fc, cfg, clock()) == a and len(fc.inserted) == 1
     long = launch({**REQ, "name": "A" * 80}, fc, cfg, clock())  # (cut to 54 characters, then the hash: 63, GCE's limit)
     assert long["id"] == "a" * 54 + "-" + jit_hash("QUJD") and len(long["id"]) == 63
+
+
+QUOTA_MESSAGE = "QUOTA_EXCEEDED: Quota 'CPUS' exceeded.  Limit: 24.0 in region us-west4."
+
+
+def test_a_request_refused_for_quota_or_capacity_moves_on_like_an_operation_error(cfg):
+    fc = FakeCompute({("us-west4-a", "e2-standard-2"): f"refused:{QUOTA_MESSAGE}",
+                      ("us-west4-b", "e2-standard-2"): "refused:ZONE_RESOURCE_POOL_EXHAUSTED: no room", ("us-west4-c", "e2-standard-2"): "ok"})
+    assert launch(REQ, fc, cfg, clock())["kind"] == "e2-standard-2"
+    assert fc.pairs == [(z, "e2-standard-2") for z in ZONES] and list(fc.vms) == [("us-west4-c", ID)]
+
+
+def test_a_request_refused_for_another_reason_ends_the_walk(cfg):
+    fc = FakeCompute({("us-west4-a", "e2-standard-2"): "rejected:PERMISSION_DENIED: Required 'compute.instances.create' permission"})
+    with pytest.raises(RuntimeError, match="^PERMISSION_DENIED"):
+        launch(REQ, fc, cfg, clock())
+    assert len(fc.inserted) == 1
+
+
+class Instances:
+    """A stand-in for Google's InstancesClient under `GoogleCompute`: `insert` raises `refusals[zone]` in that zone, and elsewhere
+    starts an operation; `get` finds no VM."""
+
+    def __init__(self, refusals: dict):
+        self.refusals, self.asked = refusals, []
+
+    def insert(self, *, project, zone, instance_resource, retry, timeout):
+        self.asked.append(zone)
+        if zone in self.refusals:
+            raise self.refusals[zone]
+        return types.SimpleNamespace(name=f"operation-{len(self.asked)}")
+
+    def get(self, *, project, zone, instance, retry, timeout):
+        raise google_errors.NotFound("The resource was not found")
+
+
+class Operations:
+    def wait(self, *, project, zone, operation, timeout):
+        return compute_v1.Operation(name=operation, status=compute_v1.Operation.Status.DONE)
+
+
+def google_compute(cfg, refusals: dict) -> GoogleCompute:
+    """A `GoogleCompute` whose Google clients are the stand-ins above (they are made when first used, so none is made here)."""
+    gc = GoogleCompute(cfg)
+    gc.__dict__.update(_instances=Instances(refusals), _operations=Operations())
+    return gc
+
+
+# What Google's client raises for an insert GCE refuses: the REST answer's message, and its `errors` with their reasons.
+QUOTA_403 = google_errors.Forbidden("Quota 'CPUS' exceeded.  Limit: 24.0 in region us-west4.",
+                                    errors=[{"message": "Quota 'CPUS' exceeded.  Limit: 24.0 in region us-west4.", "domain": "usageLimits", "reason": "quotaExceeded"}])
+PERMISSION_403 = google_errors.Forbidden("Required 'compute.instances.create' permission for 'projects/superci-test/zones/us-west4-a/instances/x'",
+                                         errors=[{"message": "Required 'compute.instances.create' permission", "domain": "global", "reason": "forbidden"}])
+
+
+@pytest.mark.parametrize("refusal,code", [
+    (QUOTA_403, "QUOTA_EXCEEDED"),
+    (google_errors.Forbidden("Quota 'PREEMPTIBLE_CPUS' exceeded.  Limit: 8.0 in region us-west4."), "QUOTA_EXCEEDED"),  # (no reason given)
+    (google_errors.ServiceUnavailable("ZONE_RESOURCE_POOL_EXHAUSTED: The zone 'projects/superci-test/zones/us-west4-a' does not have enough resources available to fulfill the request."), "ZONE_RESOURCE_POOL_EXHAUSTED"),
+], ids=["quota, by its reason", "quota, by its message", "capacity"])
+def test_google_compute_takes_a_request_refused_for_quota_or_capacity_as_no_room(cfg, refusal, code):
+    gc = google_compute(cfg, {"us-west4-a": refusal})
+    assert launch(REQ, gc, cfg, clock())["kind"] == "e2-standard-2"
+    assert gc._instances.asked == ["us-west4-a", "us-west4-b"]
+    gc = google_compute(cfg, {z: refusal for z in ZONES})
+    with pytest.raises(NoRoom) as e:
+        launch(REQ, gc, cfg, clock())
+    assert str(e.value) == f"{code}: " + ", ".join(f"{t}/{z}" for t in TYPES for z in "abc")
+
+
+def test_google_compute_raises_a_request_refused_for_permission(cfg):
+    gc = google_compute(cfg, {"us-west4-a": PERMISSION_403})
+    with pytest.raises(RuntimeError, match="^Forbidden: .*Required 'compute.instances.create' permission"):
+        launch(REQ, gc, cfg, clock())
+    assert gc._instances.asked == ["us-west4-a"]
+
+
+def test_a_request_refused_for_quota_everywhere_is_429_and_one_refused_for_permission_is_503(app_module, client, cfg, mint):
+    def post(refusal):
+        app_module.api.dependency_overrides[app_module.get_compute] = lambda: google_compute(cfg, {z: refusal for z in ZONES})
+        return client.post("/launch", json=REQ, headers=bearer(mint))
+
+    r = post(QUOTA_403)
+    assert (r.status_code, r.json()) == (429, {"detail": "no spot room in us-west4 (QUOTA_EXCEEDED: " + ", ".join(f"{t}/{z}" for t in TYPES for z in "abc") + ")"})
+    r = post(PERMISSION_403)
+    assert r.status_code == 503 and r.json()["detail"].startswith("Forbidden: Required 'compute.instances.create' permission for "), r.json()
 
 
 def test_an_unexpected_error_is_raised_and_ends_the_walk(cfg):

@@ -5,6 +5,8 @@ import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
+from launcher import Refused
+
 EXHAUSTED = "ZONE_RESOURCE_POOL_EXHAUSTED: The zone does not have enough resources available to fulfill the request."
 
 
@@ -38,6 +40,8 @@ class FakeCompute:
       "exhausted"        the operation fails with ZONE_RESOURCE_POOL_EXHAUSTED
       "slow"             the VM is made, but its operation is still running when `wait` gives up
       "error:<message>"  the operation fails with that message
+      "refused:<message>"   GCE refuses the insert request itself for want of quota or capacity: `insert` raises Refused(message)
+      "rejected:<message>"  GCE refuses the insert request itself for another reason: `insert` raises RuntimeError(message)
     A key `(zone, machine type, "on-demand")` is what an insert without the SPOT fields gets; the plain key serves both.
 
     With a `clock` given, an answer takes `answer_s` seconds to come and a wait that is shorter than that gives up
@@ -75,6 +79,10 @@ class FakeCompute:
         self.inserted.append({"zone": zone, "body": copy.deepcopy(body)})
         if (zone, body["name"]) in self.vms:
             raise RuntimeError("ALREADY_EXISTS: the resource already exists")
+        if outcome.startswith("refused:"):
+            raise Refused(outcome.removeprefix("refused:"))
+        if outcome.startswith("rejected:"):
+            raise RuntimeError(outcome.removeprefix("rejected:"))
         if outcome in ("ok", "slow"):
             self.vms[(zone, body["name"])] = {**copy.deepcopy(body), "status": "RUNNING", "creationTimestamp": rfc3339(self.wall())}
         operation = f"operation-{len(self.inserted)}"

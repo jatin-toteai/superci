@@ -210,8 +210,8 @@ class Compute(Protocol):
     whichever way it goes."""
 
     def insert(self, zone: str, body: dict) -> str:
-        """Starts making the VM `body` describes in `zone` and gives the name of the operation that makes it.
-        RuntimeError(message) when GCE refuses the request itself."""
+        """Starts making the VM `body` describes in `zone` and gives the name of the operation that makes it. When GCE refuses
+        the request itself: Refused(message) for want of quota or capacity, RuntimeError(message) for any other reason."""
         ...
 
     def wait(self, zone: str, operation: str, timeout_s: float) -> dict | None:
@@ -235,6 +235,13 @@ class Compute(Protocol):
 # An operation error that says there is no room (or no quota) for the VM in that pair, here and now: the walk goes on to the next.
 # Any other error is not the pair's lack of room and ends the launch. (The longer name is first, so a reason names the zonal code.)
 NO_ROOM_CODES = ("ZONE_RESOURCE_POOL_EXHAUSTED", "QUOTA_EXCEEDED", "RESOURCE_POOL_EXHAUSTED")
+
+
+class Refused(Exception):
+    """GCE refused an insert request itself, before any operation began, for want of quota or capacity in that pair (a 403 with
+    the reason `quotaExceeded`, or ZONE_RESOURCE_POOL_EXHAUSTED on the request). Its message is in the form of an operation's error,
+    `<CODE>: <message>` with the code one of NO_ROOM_CODES, and `_insert` takes it as one, so the walk goes on to the next pair.
+    Not a RuntimeError: that is any other refusal, which ends the launch."""
 
 
 class NoRoom(Exception):
@@ -351,9 +358,12 @@ def _answer(name: str, kind: str, spot: bool) -> dict:
 
 def _insert(compute: Compute, zone: str, body: dict, cfg: Config, left: Callable[[], float]) -> str:
     """Inserts the VM and waits for its operation as long as `cfg.insert_wait_s` and what is `left` of the budget allow.
-    The error the operation failed with, or "" when the VM is made or its operation is still running (then it is taken as started:
-    a VM that never comes up is found by the plane's sweep)."""
-    operation = compute.insert(zone, body)
+    The error the operation failed with, or that of a request refused for quota or capacity (`Refused`), or "" when the VM is made
+    or its operation is still running (then it is taken as started: a VM that never comes up is found by the plane's sweep)."""
+    try:
+        operation = compute.insert(zone, body)
+    except Refused as e:
+        return str(e)
     wait_s = min(cfg.insert_wait_s, left())
     outcome = compute.wait(zone, operation, wait_s) if wait_s > 0 else None
     return (outcome or {}).get("error", "")
@@ -497,6 +507,25 @@ def _refused(error: Exception) -> RuntimeError:
     return RuntimeError(f"{type(error).__name__}: {getattr(error, 'message', None) or error}")
 
 
+_QUOTA_MESSAGE = re.compile(r"\bQuota '[^']+' exceeded")
+
+
+def _insert_refused(error: Exception) -> Exception:
+    """What GCE's refusal of an insert request is to the launcher. Refused, with its code in front, when it is for quota (the reason
+    `quotaExceeded` or QUOTA_EXCEEDED among the error's reasons, or a message such as "Quota 'CPUS' exceeded") or for capacity (a
+    message or a reason with one of NO_ROOM_CODES); `_refused`'s RuntimeError for any other, such as PERMISSION_DENIED."""
+    message = str(getattr(error, "message", None) or error)
+    reasons = {getattr(error, "reason", None)} | {e.get("reason") for e in getattr(error, "errors", None) or [] if isinstance(e, dict)}
+    if "quotaExceeded" in reasons or _QUOTA_MESSAGE.search(message):
+        reasons.add("QUOTA_EXCEEDED")
+    for code in NO_ROOM_CODES:
+        if code in message:
+            return Refused(message)
+        if code in reasons:
+            return Refused(f"{code}: {message}")
+    return _refused(error)
+
+
 class GoogleCompute(Compute):
     """`Compute` over Google's client library, with the credentials its environment has (on the launcher's VM, that VM's service
     account). Not covered by the tests, which use a stand-in; the first real launch is its test.
@@ -526,7 +555,7 @@ class GoogleCompute(Compute):
         try:
             operation = self._instances.insert(project=self.project, zone=zone, instance_resource=instance, retry=None, timeout=self.timeout_s)
         except _FAILURES as e:
-            raise _refused(e) from e
+            raise _insert_refused(e) from e
         return operation.name
 
     def wait(self, zone: str, operation: str, timeout_s: float) -> dict | None:
