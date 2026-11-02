@@ -6826,7 +6826,7 @@ fn launch_body_of_job(clouds: &FakeClouds, n: u64) -> serde_json::Value {
 }
 
 #[test]
-fn a_gcp_launcher_is_told_spot_and_a_notice_link_and_its_machine_can_say_it_was_taken_back() {
+fn a_gcp_launcher_is_told_spot_and_a_notice_link_and_its_machine_posts_a_notice_when_it_is_taken_back() {
     let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
     let clouds = With(FakeClouds::default(), |r: &Request, _: &str| (r.url == "https://gcp.acme.example/launch").then(|| Response::new(200, "application/json", r#"{"id":"superci-1","kind":"e2-standard-2"}"#)));
     let mut config = Config::new(PLANE_ID.into());
@@ -7145,7 +7145,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         machines_whose_jobs_went_elsewhere_hand_themselves_on_or_end_as_github_and_gitlab_say,
         launchers_and_failing_runners_start_where_they_can_and_say_what_they_could_not,
         a_launcher_that_says_its_price_is_believed_and_one_that_does_not_is_priced_by_formula,
-        a_gcp_launcher_is_told_spot_and_a_notice_link_and_its_machine_can_say_it_was_taken_back,
+        a_gcp_launcher_is_told_spot_and_a_notice_link_and_its_machine_posts_a_notice_when_it_is_taken_back,
         a_gitlab_job_is_not_placed_on_a_gcp_launcher_and_with_nowhere_else_has_nowhere_to_run,
         a_launcher_saying_no_room_makes_the_job_wait_and_the_sweep_tries_again,
         a_gcp_machine_whose_runner_is_not_online_has_eight_minutes_before_it_is_stopped_and_the_job_placed_again,
