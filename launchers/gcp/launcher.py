@@ -147,10 +147,12 @@ def vm_name(runner: str, jit: str) -> str:
     """The instance name of the VM for a runner and its JIT configuration: `instance_name(runner)` cut to 54 characters, `-`, and
     the first 8 hex digits of the configuration's SHA-256 (63 characters at most). It is the `id` /launch answers.
 
-    The plane never sends one configuration for two machines: after a failed start it withdraws the runner at GitHub and registers
-    a new configuration under the same runner name, and a machine that is late to come online is stopped and launched again in the
-    same way. Keyed on the configuration, a VM found by this name was made for this request (the plane asking again after a
-    timeout), never for a configuration GitHub has withdrawn."""
+    The plane never sends one configuration twice: each start attempt withdraws the runner at GitHub and registers a new
+    configuration under the same runner name (a machine that is late to come online is stopped and started again in the same way),
+    and its call to /launch is a single send, with no retry. Keyed on the configuration, every attempt's VM has a name of its own,
+    so a VM made by a launch whose answer was lost is never found again and never reused: it holds a withdrawn configuration, its
+    runner cannot register, it powers off, and the sweep deletes it (the time bound in its startup script ends it otherwise).
+    A VM found by this name was made for a request with this very runner name and configuration."""
     return instance_name(runner)[:54] + "-" + hashlib.sha256(jit.encode()).hexdigest()[:8]
 
 
@@ -432,10 +434,11 @@ def launch(req: dict, compute: Compute, cfg: Config, now: Callable[[], float]) -
     `"spot": False`, at the on-demand price, and without the preemption notice, which an on-demand VM has none to give; its
     own no-room or error is as any other's). Otherwise NoRoom.
 
-    The VM's name is `vm_name(name, jit)`. A VM of that name in any zone is answered as it is, without an insert: the plane asking
-    again after a timeout finds the VM its first call made. One found `STOPPING` or `TERMINATED` (`ENDING_STATES`) is NoRoom, so
-    that the plane waits and asks again, by when it is gone (a `TERMINATED` one is deleted by the sweep). ValueError for a request
-    that cannot be served.
+    The VM's name is `vm_name(name, jit)`. A VM of that name in any zone is answered as it is, without an insert: so a request
+    repeated exactly finds the VM its first call made. The plane sends none: each of its start attempts has a configuration of its
+    own, so a VM whose launch answer was lost is not found again (see `vm_name`). One found `STOPPING` or `TERMINATED`
+    (`ENDING_STATES`) is NoRoom: no runner will start on it, and its name cannot be inserted again until it is gone (a `TERMINATED`
+    one is deleted by the sweep). ValueError for a request that cannot be served.
     """
     began = now()
 
