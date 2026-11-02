@@ -7031,8 +7031,8 @@ fn a_run_from_a_computers_job_is_ended_by_the_sweep_only_when_its_launcher_says_
     let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let sent = |path: &str| clouds.0.calls.borrow().iter().filter(|c| c.0 == "POST" && c.1 == format!("https://gcp.acme.example{path}")).count();
     let (job_id, run_id) = a_local_run_on_gcp(&plane, &store);
-    // Its machine still there; the launcher failing; an answer that is not "gone": asked at each sweep, and nothing changes.
-    let answers = [(200, r#"{"state":"running"}"#), (503, r#"{"detail":"UNAVAILABLE: later"}"#), (200, r#"{"state":"unknown"}"#), (200, "not json")];
+    // Its machine still there, or still stopping; the launcher failing; another answer: asked at each sweep, and nothing changes.
+    let answers = [(200, r#"{"state":"running"}"#), (200, r#"{"state":"ending"}"#), (503, r#"{"detail":"UNAVAILABLE: later"}"#), (200, r#"{"state":"unknown"}"#), (200, "not json")];
     for (n, answer) in answers.into_iter().enumerate() {
         status.set(answer);
         clock.0.set(clock.0.get() + 3 * 60_000);
@@ -7048,6 +7048,37 @@ fn a_run_from_a_computers_job_is_ended_by_the_sweep_only_when_its_launcher_says_
     assert_eq!((ended["state"].as_str(), ended["error"].as_str()), (Some("failed"), Some("its machine ended before the job did")), "{ended}");
     let record: serde_json::Value = serde_json::from_str(&store.0.borrow()[&format!("run:{run_id}")]).unwrap();
     assert_eq!((record["jobs"][0]["state"].as_str(), record["jobs"][0]["result"].as_str(), sent("/launch")), (Some("done"), Some("failure"), 1), "{record}");
+}
+
+#[test]
+fn a_notice_that_comes_while_the_sweep_asks_the_launcher_is_what_the_jobs_end_says() {
+    // GCP's notice reaches the control plane after the sweep read the job and before its launcher answered "gone": the job's end
+    // says its machine was taken back, and its run starts it again off spot.
+    let asked = std::rc::Rc::new(std::cell::Cell::new(false));
+    let status = std::cell::Cell::new((200, r#"{"state":"gone"}"#));
+    let gcp = gcp_answering(&status);
+    let seen = asked.clone();
+    let clouds = With(FakeClouds::default(), move |r: &Request, body: &str| { if r.url == "https://gcp.acme.example/status" { seen.set(true) } gcp(r, body) });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.launchers = vec![Launcher { cloud: "gcp".into(), url: "https://gcp.acme.example".into() }];
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let (job_id, _) = a_local_run_on_gcp(&plane, &store);
+    // (The notice, as its handler keeps it: the job marked interrupted, in a record written once more.)
+    let (key, noticed) = (format!("job:{job_id}"), asked.clone());
+    store.meddling(move |op, k, m| if op == "get" && k == key && noticed.replace(false) {
+        let mut j: serde_json::Value = serde_json::from_str(&m[k]).unwrap();
+        (j["interrupted"], j["rev"]) = (true.into(), (j["rev"].as_u64().unwrap_or(0) + 1).into());
+        m.insert(k.to_string(), j.to_string());
+    });
+    clock.0.set(clock.0.get() + 3 * 60_000);
+    block_on(plane.alarm()).unwrap();
+    let ended = job(&store, job_id);
+    assert_eq!((ended["state"].as_str(), ended["error"].as_str(), ended["interrupted"].as_bool()), (Some("failed"), Some("GCP took back its spot machine"), Some(true)), "{ended}");
+    let again = launch_body_of(&clouds.0, "https://gcp.acme.example/launch");
+    assert!(again["job"] != job_id && again["spot"] == false, "{again}");
 }
 
 #[test]
@@ -7275,6 +7306,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_gcp_machine_whose_runner_is_not_online_has_eight_minutes_before_it_is_stopped_and_the_job_placed_again,
         a_run_from_a_computers_job_whose_gcp_spot_machine_is_gone_fails_at_the_sweep_and_is_started_again_off_spot,
         a_run_from_a_computers_job_is_ended_by_the_sweep_only_when_its_launcher_says_its_machine_is_gone,
+        a_notice_that_comes_while_the_sweep_asks_the_launcher_is_what_the_jobs_end_says,
         a_github_jobs_gcp_machine_is_never_asked_after_by_the_sweep,
         a_runs_repository_environment_and_signing_key_are_read_as_they_are_or_said,
         a_failing_runner_that_takes_a_job_waiting_for_room_fails_it_and_its_own_job_gets_a_failing_runner_again,
