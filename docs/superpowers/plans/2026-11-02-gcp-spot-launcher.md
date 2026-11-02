@@ -20,7 +20,7 @@
 - The launch call is bounded to 8 seconds in all; each insert waits at most 5 seconds.
 - Job VMs: no service account, labels `superci-plane`, `superci-job`, `superci-repo`, `superci-max-minutes`; spot VMs use `provisioningModel: SPOT`, `instanceTerminationAction: DELETE`, `automaticRestart: false`.
 - Network path A (the plan) gives job VMs an ephemeral external address and runs the launcher on a VM; path B (only if the policy exception is refused) uses Cloud NAT and API Gateway. Tasks marked **[path B only]** are skipped unless the exception is refused.
-- Nothing Claude-branded in commits, branch names or files. Commit messages are plain and specific.
+- No tool attribution or branding in commits, branch names or files. Commit messages are plain and specific.
 - Python tests run with `pytest` in a virtualenv under `launchers/gcp/.venv`; Rust tests with `cargo test`.
 
 ## Review Focus
@@ -209,7 +209,7 @@ fn a_gcp_launcher_is_told_spot_and_a_notice_link_and_its_machine_can_say_it_was_
     assert_eq!(job(&store, 1)["interrupted"], serde_json::Value::Null);
     block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/interrupted?runner={}&t={token}", body["name"].as_str().unwrap()))));
     assert_eq!(job(&store, 1)["interrupted"], true);
-    // A label that says spot=false, and a rerun after a reclaim (no_spot): spot:false and no notice.
+    // A label with spot=false, and a rerun after a reclaim (no_spot): spot:false and no notice.
     block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/spot=false")));
     let body2: serde_json::Value = serde_json::from_str(&launch_body_of_job(2)).unwrap();
     assert!(body2["spot"] == false && body2.get("notice").is_none() && job(&store, 2)["notice"].is_null(), "{body2}");

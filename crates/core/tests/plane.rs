@@ -6852,7 +6852,7 @@ fn a_gcp_launcher_is_told_spot_and_a_notice_link_and_its_machine_can_say_it_was_
     block_on(plane.handle(labelled("completed", 1, "acme/app", Some(&name), "superci")));
     let j = job(&store, 1);
     assert!(j["error"].as_str().is_some_and(|e| e.starts_with("GCP took back its spot machine; SuperCI runs the job again by itself, off spot machines")), "{j}");
-    // A label that says spot=false: an on-demand machine, with no link, and a notice for it is ignored whatever its token.
+    // A label with spot=false: an on-demand machine, with no link, and a notice for it is ignored whatever its token.
     block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/spot=false")));
     let body2 = launch_body_of_job(&clouds.0, 2);
     let name2 = body2["name"].as_str().expect("a name").to_string();

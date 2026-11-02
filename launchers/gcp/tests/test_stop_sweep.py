@@ -161,7 +161,7 @@ def test_a_running_vm_whose_label_or_timestamp_cannot_be_read_is_left_alone_and_
 
 
 @DAMAGED
-def test_a_terminated_vm_of_this_plane_is_swept_whatever_its_label_and_timestamp_say(cfg, now, damage):
+def test_a_terminated_vm_of_this_plane_is_swept_regardless_of_its_label_and_timestamp(cfg, now, damage):
     fc = FakeCompute()
     key = made(fc, cfg, "odd", aged_min=1, now=now)
     fc.vms[key]["status"] = "TERMINATED"
