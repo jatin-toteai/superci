@@ -1099,9 +1099,12 @@ fn aws_machine(j: &serde_json::Value) -> Option<(String, String, String)> {
 fn off_spot(j: &serde_json::Value) -> Option<(String, Option<String>)> {
     // (Or why one kept off spot machines is on one after all: its on-demand machine did not fit the account's limit.)
     if j["spot_again"] == true && j["on_demand"] != true && (j["cloud"] == "aws" || j["cloud"] == "") { return Some(("On a spot machine again: an on-demand one does not fit your AWS account's on-demand limit".into(), None)) }
-    if j["on_demand"] != true || j["cloud"] != "aws" { return None }
-    // Run again after AWS took its spot machine back: SuperCI's own choice, whatever spot machines there were.
-    if j["after_reclaim"] == true { return Some(("On-demand: run again after AWS took back its spot machine".into(), None)) }
+    if j["on_demand"] != true { return None }
+    // Run again after its cloud took its spot machine back (AWS, or a launcher's: GCP): SuperCI's own choice, whatever spot machines there were.
+    let cloud = j["cloud"].as_str().unwrap_or_default();
+    if j["after_reclaim"] == true && !cloud.is_empty() { return Some((format!("On-demand: run again after {} took back its spot machine", cloud_name(cloud)), None)) }
+    // What AWS said of spot, below, is AWS's alone.
+    if cloud != "aws" { return None }
     let said = j["spot_refused"].as_str()?;
     // The account's AWS organization allows no spot machines: no limit to raise, and nothing of AWS's to wait for.
     if said.contains(superci_core::plane::SPOT_NOT_ALLOWED) { return Some(("On-demand: your AWS organization does not allow spot machines".into(), None)) }
@@ -4474,6 +4477,10 @@ mark();load()})();</script>"#;
             format!(r#"<form method="post" action="/aws/connect" class="aws-add"><details class="change"><summary class="button secondary sm">Change region</summary><select name="region" aria-label="Region">{}</select></details><button class="button primary sm">Add</button></form>"#,
                 region_select_options("us-east-1", &self.quotas, &closest(Some(v)), self.aws_look()))
         } else { connect_action("aws") };
+        // GCP: a launcher you run, added by its address (the control plane asks it who it is before keeping it).
+        let gcp = if launcher("gcp") { added.clone() } else {
+            row_form("/runners/gcp", r#"<input type="url" name="url" placeholder="https://launcher.example" required aria-label="Launcher address" style="width:240px;max-width:100%;min-width:0;height:32px;padding:0 10px;border:1px solid var(--rule);border-radius:9px;background:var(--card);color:var(--ink);font-size:12.5px">"#, "Add")
+        };
         // A Modal control plane starts sandboxes itself; one elsewhere gets a small launcher in your Modal workspace.
         let own_modal = matches!(v.plane, Plane::Modal { .. });
         let modal = if launcher("modal") || (own_modal && v.own_containers()) { added } else if own_modal { row_form("/runners/modal-own", "", "Add") } else if self.modal.is_some() { row_form("/runners/modal", "", "Add") }
@@ -4488,8 +4495,9 @@ mark();load()})();</script>"#;
             }
             _ => "Spot machines, one per job, in your AWS account.".to_string(),
         };
-        let rows = format!("{}{}{}{}", provider_row("cloudflare", containers, &cloudflare), provider_row_html("aws", &aws_what, &aws),
-            provider_row("modal", "Sandboxes, one per job, in your Modal workspace. The first add builds a small image.", &modal), more_clouds(&RUNNERS_SOON));
+        let rows = format!("{}{}{}{}{}", provider_row("cloudflare", containers, &cloudflare), provider_row_html("aws", &aws_what, &aws),
+            provider_row("modal", "Sandboxes, one per job, in your Modal workspace. The first add builds a small image.", &modal),
+            provider_row("gcp", "Spot VMs, one per job, in your GCP project, through a launcher you run. Add it by its address.", &gcp), more_clouds(&RUNNERS_SOON));
         format!(r#"<div class="bar"><h1 class="page-title">Add a provider</h1><a class="chip" href="/?p=runners">Back to runners</a></div><p class="note" style="margin-bottom:22px">Where runners come from: each provider starts a fresh one for every job. Add one or more.</p><div class="picks page">{rows}</div>"#)
     }
 
@@ -5494,13 +5502,17 @@ fn remove_dialog(v: &PlaneView, cloud: &str, i: usize, signed_in: &[&str]) -> St
         else { format!(r#"<p class="note">Deleted in {name}:</p><ul class="needs">{}</ul>"#, deleted.iter().map(|d| format!("<li><span>{}</span></li>", esc(d))).collect::<String>()) };
     let running = running_on(&st, cloud);
     let (stop, warn) = if running == 0 { (String::new(), String::new()) } else {
-        (r#"<input type="hidden" name="stop" value="on">"#.to_string(), format!(r#"<p class="note bad-text">{running} job{} running there {}.</p>"#, if running == 1 { " is" } else { "s are" }, if own { "finish on their own" } else { "stop, and fail on GitHub" }))
+        // (A GCP launcher's machines are its own: SuperCI stops none, so they finish. The route still asks for the confirmation.)
+        let ends = if cloud == "gcp" { if running == 1 { ". It finishes, and its machine ends with it" } else { ". They finish, and their machines end with them" } } else if own { " finish on their own" } else { " stop, and fail on GitHub" };
+        (r#"<input type="hidden" name="stop" value="on">"#.to_string(), format!(r#"<p class="note bad-text">{running} job{} running there{ends}.</p>"#, if running == 1 { " is" } else { "s are" }))
     };
     let can = own || cloud == "gcp" || signed_in.contains(&cloud);
-    let main = if can { format!(r#"<button class="button danger sm">{}</button>"#, if running > 0 && !own { format!("Stop {running} and remove") } else { "Remove".into() }) } else { String::new() };
+    let main = if can { format!(r#"<button class="button danger sm">{}</button>"#, if running > 0 && !own && cloud != "gcp" { format!("Stop {running} and remove") } else { "Remove".into() }) } else { String::new() };
     let signin = if can { String::new() } else { format!(r#"<div class="dlg-signin"><span class="note">Sign in with {name} to delete these.</span>{}</div>"#, signin_button(cloud, &format!("Sign in with {name}"), true)) };
     let only = if own || cloud == "gcp" { String::new() } else { r#"<button class="button secondary sm" name="only" value="on">Remove from SuperCI only</button>"#.to_string() };
-    format!(r#"<dialog class="dlg" id="pool-remove-{i}" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head">{}<span><strong>Remove {}?</strong><small>Jobs stop going to {}. Your control plane and your sign-ins stay; adding it back is a click.</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>{what}{warn}{signin}<form method="post" action="/runners/remove" class="dlg-foot"><input type="hidden" name="plane" value="{}"><input type="hidden" name="cloud" value="{}">{stop}<button type="button" class="button secondary sm" style="margin-right:auto" onclick="this.closest('dialog').close()">Cancel</button>{only}{main}</form></div></dialog>"#,
+    // (A GCP launcher has no sign-in to keep: adding it back takes its address.)
+    let back = if cloud == "gcp" { "Your control plane stays; adding it back takes its address, under Add provider." } else { "Your control plane and your sign-ins stay; adding it back is a click." };
+    format!(r#"<dialog class="dlg" id="pool-remove-{i}" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head">{}<span><strong>Remove {}?</strong><small>Jobs stop going to {}. {back}</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>{what}{warn}{signin}<form method="post" action="/runners/remove" class="dlg-foot"><input type="hidden" name="plane" value="{}"><input type="hidden" name="cloud" value="{}">{stop}<button type="button" class="button secondary sm" style="margin-right:auto" onclick="this.closest('dialog').close()">Cancel</button>{only}{main}</form></div></dialog>"#,
         logo(&logo_key, 36), esc(&name), esc(&name), esc(id), esc(cloud))
 }
 
@@ -5567,8 +5579,8 @@ fn needs_text(needs: &[(&str, superci_core::permissions::Need)]) -> String {
 }
 
 /// Each provider and code host the dashboard names, as people call it.
-const PROVIDER_NAMES: [(&str, &str); 24] = [
-    ("aws", "AWS"), ("cloudflare", "Cloudflare"), ("modal", "Modal"), ("googlecloud", "Google Cloud"), ("azure", "Azure"), ("hetzner", "Hetzner"),
+const PROVIDER_NAMES: [(&str, &str); 25] = [
+    ("aws", "AWS"), ("cloudflare", "Cloudflare"), ("modal", "Modal"), ("gcp", "GCP"), ("googlecloud", "Google Cloud"), ("azure", "Azure"), ("hetzner", "Hetzner"),
     ("digitalocean", "DigitalOcean"), ("flydotio", "Fly.io"), ("kubernetes", "Kubernetes"), ("vercel", "Vercel"), ("netlify", "Netlify"), ("deno", "Deno Deploy"),
     ("github", "GitHub"), ("gitlab", "GitLab"), ("bitbucket", "Bitbucket"), ("forgejo", "Forgejo"), ("gitea", "Gitea"), ("azuredevops", "Azure DevOps"),
     ("machine", "Your own computer"), ("render", "Render"), ("railway", "Railway"), ("scaleway", "Scaleway"), ("vultr", "Vultr"), ("akamai", "Akamai (Linode)"),
@@ -6025,6 +6037,8 @@ fn clouds_card(v: &PlaneView, signed_in: &[&str]) -> String {
                 let field = if st.get("cloudflare_location").is_some() { format!(r#"<label class="field"><span>GitHub's full image (experimental)</span><input type="url" name="image" value="{}" placeholder="https://… (empty: the small image)"><small>Jobs then run inside GitHub's own runner image, with everything it has, loaded from this address as it is read and checked piece by piece (an address as <code>image-reader pack</code> names it). Empty: GitHub's small runner image, with few tools.</small></label>"#, esc(&image)) } else { String::new() };
                 (name.clone(), if image.is_empty() { "GitHub's small runner image".into() } else { "GitHub's full image (experimental)".to_string() }, field)
             }
+            // (A GCP launcher is one you run: its address says which.)
+            "gcp" => (name.clone(), format!("Its launcher starts a VM for each job{}", v.launchers().iter().find(|a| a.cloud == "gcp").map(|a| format!(" · {}", a.url)).unwrap_or_default()), String::new()),
             _ => (name.clone(), "Its launcher starts the sandboxes".to_string(), String::new()),
         };
         let n = 100 + i;
@@ -8018,6 +8032,13 @@ mod tests {
         let mut again = ran(Some("us-east-1 on-demand: VcpuLimitExceeded"));
         again["after_reclaim"] = true.into();
         assert_eq!(job_words(&again)["why"], "On-demand: run again after AWS took back its spot machine");
+        // A job on a GCP launcher's spot machine says its own cloud took it back (and AWS's answers are not its).
+        let mut gcp = again.clone();
+        gcp["cloud"] = "gcp".into();
+        assert_eq!(job_words(&gcp)["why"], "On-demand: run again after GCP took back its spot machine");
+        assert!(job_table(&[gcp.clone()]).contains(r#"<small class="jt-why open">On-demand: run again after GCP took back its spot machine</small>"#));
+        gcp["after_reclaim"] = false.into();
+        assert_eq!(job_words(&gcp)["why"], "", "no AWS spot answer on a GCP job");
         (again["on_demand"], again["spot_again"]) = (false.into(), true.into());
         assert_eq!(job_words(&again)["why"], "On a spot machine again: an on-demand one does not fit your AWS account's on-demand limit");
         // A disk that is not the standard one is in the job's row, beside its machine.
@@ -8239,6 +8260,33 @@ mod tests {
         assert!(job_words(&job("done", None))["ended"].is_null() && job_words(&job("failed", None))["ended"].is_null());
     }
 
+    /// A GCP launcher is added by its address, from the list of providers, until one is there; then its address is
+    /// shown with the way to remove it.
+    #[test]
+    fn the_runners_page_offers_to_add_a_gcp_launcher_by_its_address_until_one_is_there() {
+        let d = with_cloudflare(&[("a1", "Acme Inc.")]);
+        let plane = Plane::Cloudflare { account_id: "a1".into(), account_name: "Acme Inc.".into(), script: "superci".into(), url: "https://superci.acme.workers.dev".into(), plane_id: "p1".into(), label: "superci".into() };
+        let view = |launchers: serde_json::Value, order: serde_json::Value| PlaneView { plane: plane.clone(), online: true, github: true, installed: true, aws: false, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()),
+            status: Some(serde_json::json!({ "containers": true, "own_cloud": "cloudflare", "launchers": launchers, "routing": { "rules": [], "order": order }, "jobs": [] })) };
+        let row = |html: &str| { let at = html.find("<strong>GCP</strong>").unwrap(); html[html[..at].rfind(r#"<div class="pick act">"#).unwrap()..at + html[at..].find("</div>").unwrap()].to_string() };
+
+        // None yet: a row with a field for its address and an Add button, posting where the address is checked.
+        let html = d.render("add-runners", &[view(serde_json::json!([]), serde_json::json!([{ "cloud": "cloudflare" }]))], None);
+        let gcp = row(&html);
+        let form = &gcp[gcp.find(r#"<form method="post" action="/runners/gcp">"#).unwrap_or_else(|| panic!("{gcp}"))..];
+        assert!(form.contains(r#"type="url""#) && form.contains(r#"name="url""#) && form.contains(r#"placeholder="https://launcher.example""#) && form.contains(" required") && form.contains(r#"aria-label="Launcher address""#), "{gcp}");
+        assert!(form.contains(r#"<button class="button primary sm">Add</button></form>"#) && !gcp.contains("Added"), "{gcp}");
+
+        // One there: no form to add another, and the Runners page shows its address with the way to remove it.
+        let there = view(serde_json::json!([{ "cloud": "gcp", "url": "https://launcher.example" }]), serde_json::json!([{ "cloud": "cloudflare" }, { "cloud": "gcp" }]));
+        let html = d.render("add-runners", &[there.clone()], None);
+        let gcp = row(&html);
+        assert!(gcp.contains("Added") && !gcp.contains("<form") && !html.contains(r#"action="/runners/gcp""#), "{gcp}");
+        let html = d.render("runners", &[there], None);
+        assert!(html.contains("<small>Its launcher starts a VM for each job · https://launcher.example</small>") && !html.contains(r#"action="/runners/gcp""#), "its address, and no field for another");
+        assert!(html.contains(r#"<form method="post" action="/runners/remove" class="dlg-foot"><input type="hidden" name="plane" value="p1"><input type="hidden" name="cloud" value="gcp">"#) && html.contains("Remove GCP?"), "and the way to remove it");
+    }
+
     /// A GCP launcher is one you deployed: its removal deletes nothing, needs no sign-in, and says it keeps running.
     #[test]
     fn removing_a_gcp_launcher_deletes_nothing_asks_no_sign_in_and_says_it_keeps_running() {
@@ -8252,10 +8300,20 @@ mod tests {
         let gcp = dialog(&html);
         assert!(gcp.contains(r#"name="cloud" value="gcp""#) && gcp.contains("Nothing is deleted: the launcher keeps running where you deployed it, and your control plane stops sending it jobs."), "{gcp}");
         assert!(gcp.contains(r#"<button class="button danger sm">Remove</button>"#) && !gcp.contains("Sign in") && !gcp.contains("Cloudflare") && !gcp.contains(r#"name="only""#), "{gcp}");
-        // Jobs running there: said, and the removal stops them, still with no sign-in.
-        let html = d.render("runners", &[view(serde_json::json!([{ "job_id": 7, "run_id": 70, "repo": "acme/app", "state": "running", "cloud": "gcp", "at_ms": 1 }]))], None);
+        // Adding it back takes its address (there is no sign-in to come back with), on the page that adds providers.
+        assert!(gcp.contains("<small>Jobs stop going to GCP. Your control plane stays; adding it back takes its address, under Add provider.</small>") && !gcp.contains("a click"), "{gcp}");
+        // The Clouds row says what a GCP launcher starts: a VM for each job, not a sandbox.
+        let row = { let at = html.find("Its launcher starts").unwrap(); html[html[..at].rfind("<li").unwrap()..at + html[at..].find("</li>").unwrap()].to_string() };
+        assert!(row.contains("starts a VM for each job") && !row.contains("sandboxes"), "{row}");
+        // Jobs running there: said as finishing with their machines ending (SuperCI stops none), the button still
+        // Remove, and the removal confirmed as the route asks (it refuses while jobs run, without that).
+        let running = |n: u64| serde_json::json!((1..=n).map(|i| serde_json::json!({ "job_id": i, "run_id": 70 + i, "repo": "acme/app", "state": "running", "cloud": "gcp", "at_ms": 1 })).collect::<Vec<_>>());
+        let html = d.render("runners", &[view(running(1))], None);
         let gcp = dialog(&html);
-        assert!(gcp.contains("1 job is running there stop, and fail on GitHub") && gcp.contains(r#"<button class="button danger sm">Stop 1 and remove</button>"#) && !gcp.contains("Sign in"), "{gcp}");
+        assert!(gcp.contains("1 job is running there. It finishes, and its machine ends with it.") && gcp.contains(r#"<button class="button danger sm">Remove</button>"#) && !gcp.contains("Stop 1") && !gcp.contains("fail on GitHub") && !gcp.contains("Sign in"), "{gcp}");
+        assert!(gcp.contains(r#"<input type="hidden" name="stop" value="on">"#), "{gcp}");
+        let gcp = dialog(&d.render("runners", &[view(running(2))], None));
+        assert!(gcp.contains("2 jobs are running there. They finish, and their machines end with them.") && gcp.contains(r#"<button class="button danger sm">Remove</button>"#) && !gcp.contains("Stop 2"), "{gcp}");
         // The machine picker knows what a GCP launcher can run.
         assert_eq!(pool_caps("gcp"), serde_json::json!([Capacity::gcp()]));
     }
