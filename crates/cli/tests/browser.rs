@@ -7841,10 +7841,10 @@ fn a_machine_taken_back_is_noted_once_and_a_jobs_log_is_githubs_then_what_its_ma
         m.insert("runner:r-live".into(), "74".into());
     }
     let record = |k: &str| served.store.under(k).into_iter().find(|(key, _)| key == k).map(|(_, v)| v).unwrap_or_default();
-    // A run from a computer's machine taken back: started again at once, it says; said again, noted once.
+    // A run from a computer's machine taken back: started again, it says; said again, noted once.
     for _ in 0..2 {
         let (status, said) = say(&format!("/interrupted?runner=r-local&t={notice}"), "");
-        assert!(status == 200 && said.contains("starts the job again by itself at once"), "{status} {said}");
+        assert!(status == 200 && said.contains("starts the job again by itself, off spot machines"), "{status} {said}");
     }
     assert!(record("job:71")["interrupted"] == true && served.store.under("spot:interrupted:").len() == 1, "{:?}", served.store.under("spot:"));
     // A job over already: nothing noted.
