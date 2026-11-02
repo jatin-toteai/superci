@@ -265,6 +265,14 @@ def test_the_disk_is_the_size_asked_for_and_sixty_gb_when_none_is(cfg):
         assert fc.inserted[0]["body"]["disks"][0]["initializeParams"]["diskSizeGb"] == size
 
 
+def test_a_disk_smaller_than_the_image_is_raised_to_the_images_size(cfg):
+    # (The plane's failing runner asks for 8 GB; GCE refuses a boot disk smaller than its image, which is 10 GB.)
+    for asked, size in ((8, 10), (1, 10), (10, 10), (11, 11)):
+        fc = FakeCompute({("us-west4-a", "e2-standard-2"): "ok"})
+        launch({**REQ, "disk_gb": asked}, fc, cfg, clock())
+        assert fc.inserted[0]["body"]["disks"][0]["initializeParams"]["diskSizeGb"] == size, asked
+
+
 def test_on_path_b_the_vm_has_no_external_address(cfg):
     fc = FakeCompute({("us-west4-a", "e2-standard-2"): "ok"})
     launch(REQ, fc, dataclasses.replace(cfg, external_address=False), clock())

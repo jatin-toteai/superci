@@ -310,6 +310,11 @@ def subnet_path(cfg: Config) -> str:
     return cfg.subnet if "/" in cfg.subnet else f"projects/{cfg.project}/regions/{cfg.region}/subnetworks/{cfg.subnet}"
 
 
+# The size in GB of the superci-runner image (image/build-image.sh makes it from a 10 GB boot disk): GCE refuses a boot disk smaller
+# than its image. A request for less, such as the plane's failing runner with 8 GB, gets this.
+MIN_DISK_GB = 10
+
+
 def _vm_body(cfg: Config, ask: _Ask, zone: str, kind: str, spot: bool, script: str) -> dict:
     """The Instance resource of a job VM of machine type `kind` in `zone`: a spot VM (deleted when GCE takes it back, never restarted)
     or an on-demand one. No service account: a job runs as root on its VM and must not reach the project."""
@@ -326,7 +331,7 @@ def _vm_body(cfg: Config, ask: _Ask, zone: str, kind: str, spot: bool, script: s
             "boot": True, "autoDelete": True, "type": "PERSISTENT",  # (autoDelete: a deleted VM leaves no disk behind)
             "initializeParams": {
                 "sourceImage": f"projects/{cfg.project}/global/images/family/{cfg.image_family}",
-                "diskSizeGb": ask.disk_gb,
+                "diskSizeGb": max(ask.disk_gb, MIN_DISK_GB),
                 # c4d takes Hyperdisk only
                 "diskType": f"zones/{zone}/diskTypes/{'hyperdisk-balanced' if kind.startswith('c4d-') else 'pd-balanced'}",
             },
